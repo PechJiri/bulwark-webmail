@@ -1,7 +1,7 @@
 /**
  * @vitest-environment node
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
 const cookieSet = vi.fn();
@@ -40,6 +40,7 @@ import { GET } from './route';
 
 describe('GET /api/auth/sso/start', () => {
   beforeEach(() => vi.clearAllMocks());
+  afterEach(() => delete process.env.OAUTH_POST_LOGOUT_REDIRECT_URI);
 
   it('starts browser SSO and redirects directly to the provider', async () => {
     const response = await GET(new NextRequest(
@@ -67,5 +68,18 @@ describe('GET /api/auth/sso/start', () => {
 
     expect(response.status).toBe(400);
     expect(cookieSet).not.toHaveBeenCalled();
+  });
+
+  it('uses the configured public origin behind a host-rewriting reverse proxy', async () => {
+    process.env.OAUTH_POST_LOGOUT_REDIRECT_URI = 'https://webmail.pechovic.cz/cs/login';
+
+    const response = await GET(new NextRequest(
+      'http://0.0.0.0:3000/api/auth/sso/start?locale=cs&return=redirect',
+    ));
+
+    expect(response.status).toBe(307);
+    const location = new URL(response.headers.get('location')!);
+    expect(location.searchParams.get('redirect_uri'))
+      .toBe('https://webmail.pechovic.cz/cs/auth/callback');
   });
 });

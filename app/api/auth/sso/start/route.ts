@@ -23,6 +23,15 @@ interface StartSsoInput {
   mobileState?: string | null;
   purpose?: string | null;
   directRedirect?: boolean;
+  expectedOrigin?: string;
+}
+
+function getConfiguredPublicOrigin(request: NextRequest): string {
+  const configured = process.env.OAUTH_POST_LOGOUT_REDIRECT_URI?.trim();
+  if (!configured) return request.nextUrl.origin;
+  const url = new URL(configured);
+  if (url.protocol !== 'https:') throw new Error('OAUTH_POST_LOGOUT_REDIRECT_URI must use HTTPS');
+  return url.origin;
 }
 
 async function startSso(request: NextRequest, input: StartSsoInput): Promise<NextResponse> {
@@ -38,6 +47,7 @@ async function startSso(request: NextRequest, input: StartSsoInput): Promise<Nex
     mobileState = null,
     purpose = null,
     directRedirect = false,
+    expectedOrigin,
   } = input;
   const isReauth = purpose === 'reauth';
 
@@ -45,7 +55,7 @@ async function startSso(request: NextRequest, input: StartSsoInput): Promise<Nex
     return NextResponse.json({ error: 'Invalid mobile_redirect_uri' }, { status: 400 });
   }
 
-  const requestOrigin = request.headers.get('origin') || request.nextUrl.origin;
+  const requestOrigin = expectedOrigin || request.headers.get('origin') || request.nextUrl.origin;
   try {
     const redirectOrigin = new URL(redirectUri).origin;
     if (redirectOrigin !== requestOrigin) {
@@ -113,10 +123,12 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid locale' }, { status: 400 });
     }
 
+    const publicOrigin = getConfiguredPublicOrigin(request);
     return await startSso(request, {
-      redirectUri: `${request.nextUrl.origin}/${locale}/auth/callback`,
+      redirectUri: `${publicOrigin}/${locale}/auth/callback`,
       locale,
       directRedirect: true,
+      expectedOrigin: publicOrigin,
     });
   } catch (error) {
     logger.error('SSO start error', { error: error instanceof Error ? error.message : 'Unknown error' });
