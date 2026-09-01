@@ -166,7 +166,6 @@ export async function PUT(request: NextRequest) {
 
     if (!refreshToken) {
       cookieStore.delete(accessTokenCookieName(slot));
-      cookieStore.delete(idTokenCookieName(slot));
       return NextResponse.json({ error: 'No refresh token' }, { status: 401 });
     }
 
@@ -216,7 +215,6 @@ export async function PUT(request: NextRequest) {
         cookieStore.delete(cookieName);
         cookieStore.delete(refreshTokenServerCookieName(slot));
         cookieStore.delete(accessTokenCookieName(slot));
-        cookieStore.delete(idTokenCookieName(slot));
         return NextResponse.json({ error: 'Refresh failed' }, { status: 401 });
       }
       return NextResponse.json({ error: 'Token endpoint unavailable' }, { status: 503 });

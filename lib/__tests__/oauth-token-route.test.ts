@@ -273,11 +273,28 @@ describe('oauth token route - access token cache (#552)', () => {
 
   it('does not serve a cached token once the refresh token is gone', async () => {
     seedCachedToken('orphan-token', 1500);
+    cookieStore.set('jmap_it', 'logout-hint');
 
     const { status } = await callPut();
 
     expect(status).toBe(401);
     expect(cookieStore.deleted).toContain('jmap_at');
+    expect(cookieStore.get('jmap_it')?.value).toBe('logout-hint');
+  });
+
+  it('preserves the ID-token hint when refresh is rejected so provider logout can still finish', async () => {
+    cookieStore.set('jmap_rt', 'rejected-refresh-token');
+    cookieStore.set('jmap_it', 'logout-hint');
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 400,
+      text: async () => 'invalid_grant',
+    });
+
+    const { status } = await callPut({ force: 'true' });
+
+    expect(status).toBe(401);
+    expect(cookieStore.get('jmap_it')?.value).toBe('logout-hint');
   });
 
   it('stores the ID token returned by the authorization-code exchange', async () => {
