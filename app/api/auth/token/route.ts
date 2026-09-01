@@ -8,9 +8,10 @@ import {
   encodeCachedAccessToken,
   decodeCachedAccessToken,
 } from '@/lib/oauth/tokens';
-import { exchangeCodeForTokens, buildOAuthParams, getMetadata, getTokenEndpoint, DEFAULT_CLIENT_ID } from '@/lib/oauth/token-exchange';
+import { exchangeCodeForTokens, buildOAuthParams, getMetadata, getRequiredConfig, getTokenEndpoint, DEFAULT_CLIENT_ID } from '@/lib/oauth/token-exchange';
 import { getCookieOptions } from '@/lib/oauth/cookie-config';
 import { MAX_ACCOUNT_SLOTS } from '@/lib/account-utils';
+import { buildEndSessionUrl } from '@/lib/oauth/logout';
 
 function getSlot(request: NextRequest): number {
   const raw = request.nextUrl.searchParams.get('slot');
@@ -21,6 +22,24 @@ function getSlot(request: NextRequest): number {
 }
 
 type CookieStore = Awaited<ReturnType<typeof cookies>>;
+
+async function discoverEndSessionUrl(serverId?: string | null): Promise<string | undefined> {
+  const postLogoutRedirectUri = process.env.OAUTH_POST_LOGOUT_REDIRECT_URI?.trim();
+  if (!postLogoutRedirectUri) return undefined;
+
+  const metadata = await getMetadata(serverId, { fallbackClientId: DEFAULT_CLIENT_ID }).catch((err) => {
+    logger.warn('Failed to discover OAuth metadata during logout', {
+      error: err instanceof Error ? err.message : 'Unknown error',
+    });
+    return null;
+  });
+  if (!metadata?.end_session_endpoint) return undefined;
+
+  const { clientId } = getRequiredConfig(serverId, { fallbackClientId: DEFAULT_CLIENT_ID });
+  const result = buildEndSessionUrl(metadata.end_session_endpoint, clientId, postLogoutRedirectUri);
+  if (!result) logger.warn('Ignoring invalid OAuth logout configuration');
+  return result;
+}
 
 /**
  * Cache the access token for the slot so a page reload can resume with it.
@@ -203,7 +222,8 @@ export async function DELETE(request: NextRequest) {
         cookieStore.delete(serverCookieName);
         cookieStore.delete(accessTokenCookieName(i));
       }
-      return NextResponse.json({ ok: true });
+      const end_session_url = await discoverEndSessionUrl();
+      return NextResponse.json({ ok: true, ...(end_session_url && { end_session_url }) });
     }
 
     const slot = getSlot(request);
@@ -244,19 +264,14 @@ export async function DELETE(request: NextRequest) {
     cookieStore.delete(refreshTokenServerCookieName(slot));
     cookieStore.delete(accessTokenCookieName(slot));
 
-    let end_session_url: string | undefined;
-    if (metadata?.end_session_endpoint) {
-      try {
-        const parsed = new URL(metadata.end_session_endpoint);
-        if (parsed.protocol === 'https:') {
-          end_session_url = metadata.end_session_endpoint;
-        } else {
-          logger.warn('Ignoring non-HTTPS end_session_endpoint', { url: metadata.end_session_endpoint });
-        }
-      } catch {
-        logger.warn('Invalid end_session_endpoint URL', { url: metadata.end_session_endpoint });
-      }
-    }
+    const postLogoutRedirectUri = process.env.OAUTH_POST_LOGOUT_REDIRECT_URI?.trim();
+    const end_session_url = metadata?.end_session_endpoint && postLogoutRedirectUri
+      ? buildEndSessionUrl(
+          metadata.end_session_endpoint,
+          getRequiredConfig(slotServerId, { fallbackClientId: DEFAULT_CLIENT_ID }).clientId,
+          postLogoutRedirectUri,
+        )
+      : undefined;
 
     return NextResponse.json({ ok: true, ...(end_session_url && { end_session_url }) });
   } catch (error) {

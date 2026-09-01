@@ -1384,7 +1384,13 @@ if (typeof window !== 'undefined') {
   // Ensure template-store is loaded (and the bridge registered) even before
   // any UI component imports it, so the first sync push already carries the
   // templates.
-  void import('./template-store');
+  void import('./template-store').catch((error) => {
+    // This bridge is optional until templates are first opened. A chunk-load
+    // failure (including a page navigation while it is in flight) must not
+    // surface as an unhandled rejection or destabilize the application/test
+    // environment; a later direct import still registers the bridge.
+    syncWarn('Template sync bridge could not be loaded:', error);
+  });
 }
 
 /**

@@ -55,6 +55,26 @@ describe('auth-store logout redirects', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/auth/session?slot=0', { method: 'DELETE', keepalive: true });
   });
 
+  it('completes provider logout before restarting automatic SSO', async () => {
+    const endSessionUrl = 'https://sso.pechovic.cz/realms/pechovic/protocol/openid-connect/logout'
+      + '?client_id=family-bulwark&post_logout_redirect_uri=https%3A%2F%2Fwebmail.pechovic.cz%2Fcs%2Flogin';
+    const fetchMock = vi.fn(async (input: FetchInput) => {
+      if (String(input).startsWith('/api/auth/token')) {
+        return { ok: true, json: async () => ({ ok: true, end_session_url: endSessionUrl }) };
+      }
+      return { ok: true, json: async () => ({ ok: true }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const replaceSpy = vi.spyOn(browserNavigation, 'replaceWindowLocation').mockImplementation(() => {});
+
+    sessionStorage.setItem('sso_attempted', '1');
+    useAuthStore.setState({ isAuthenticated: true, authMode: 'oauth' });
+    await useAuthStore.getState().logout();
+
+    expect(sessionStorage.getItem('sso_attempted')).toBeNull();
+    expect(replaceSpy).toHaveBeenCalledWith(endSessionUrl);
+  });
+
   it('marks session expiry, preserves the current path, and redirects to login when the refresh is rejected (401)', async () => {
     vi.useFakeTimers();
 
@@ -62,7 +82,7 @@ describe('auth-store logout redirects', () => {
       const url = String(input);
       const method = init?.method ?? 'GET';
 
-      if (url === '/api/auth/token?slot=0' && method === 'PUT') {
+      if (url === '/api/auth/token?slot=0&force=true' && method === 'PUT') {
         return { ok: false, status: 401, json: async () => ({}) };
       }
 
@@ -102,7 +122,7 @@ describe('auth-store logout redirects', () => {
       const url = String(input);
       const method = init?.method ?? 'GET';
 
-      if (url === '/api/auth/token?slot=0' && method === 'PUT') {
+      if (url === '/api/auth/token?slot=0&force=true' && method === 'PUT') {
         return { ok: false, status: 503, json: async () => ({}) };
       }
 
@@ -126,7 +146,7 @@ describe('auth-store logout redirects', () => {
     expect(replaceSpy).not.toHaveBeenCalled();
 
     const countPuts = () => fetchMock.mock.calls.filter(
-      ([input, init]) => String(input) === '/api/auth/token?slot=0' && init?.method === 'PUT',
+      ([input, init]) => String(input) === '/api/auth/token?slot=0&force=true' && init?.method === 'PUT',
     ).length;
 
     // A retry is armed: advancing past the ~30 s window fires a second PUT.
@@ -149,7 +169,7 @@ describe('auth-store logout redirects', () => {
       const url = String(input);
       const method = init?.method ?? 'GET';
 
-      if (url === '/api/auth/token?slot=0' && method === 'PUT') {
+      if (url === '/api/auth/token?slot=0&force=true' && method === 'PUT') {
         return new Promise((resolve) => { resolveInFlight = resolve; });
       }
       if (method === 'DELETE') {
@@ -175,7 +195,7 @@ describe('auth-store logout redirects', () => {
 
     // The failure lands after the sign-out - no retry may be re-armed.
     const countPuts = () => fetchMock.mock.calls.filter(
-      ([input, init]) => String(input) === '/api/auth/token?slot=0' && init?.method === 'PUT',
+      ([input, init]) => String(input) === '/api/auth/token?slot=0&force=true' && init?.method === 'PUT',
     ).length;
     expect(countPuts()).toBe(1);
     await vi.advanceTimersByTimeAsync(600_000);
@@ -189,7 +209,7 @@ describe('auth-store logout redirects', () => {
       const url = String(input);
       const method = init?.method ?? 'GET';
 
-      if (url === '/api/auth/token?slot=0' && method === 'PUT') {
+      if (url === '/api/auth/token?slot=0&force=true' && method === 'PUT') {
         throw new TypeError('Failed to fetch');
       }
 

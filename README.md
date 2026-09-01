@@ -155,6 +155,7 @@ OAUTH_CLIENT_ID=webmail
 OAUTH_CLIENT_SECRET=              # optional, for confidential clients
 OAUTH_CLIENT_SECRET_FILE=         # path to a file containing the secret
 OAUTH_ISSUER_URL=                 # optional, for external IdPs
+OAUTH_POST_LOGOUT_REDIRECT_URI=   # exact IdP-registered return URL after logout
 OAUTH_AUTHORIZE_URL=              # override only the user-facing authorize endpoint
 OAUTH_ALLOW_PRIVATE_ENDPOINTS=    # allow discovery to resolve to RFC-1918 addresses
 

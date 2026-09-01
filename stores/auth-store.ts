@@ -360,6 +360,18 @@ export function redirectToLogin(): void {
   replaceWindowLocation(loginPath);
 }
 
+function redirectAfterLogout(endSessionUrl?: string): void {
+  try {
+    // A successful SSO round-trip can leave the client-side loop guard behind
+    // because navigation happens before its timeout fires. Explicit logout
+    // starts a new authentication journey and must not inherit that guard.
+    sessionStorage.removeItem('sso_attempted');
+  } catch {
+    /* noop */
+  }
+  replaceWindowLocation(endSessionUrl || getLocaleLoginPath());
+}
+
 function markSessionExpired(): void {
   try {
     sessionStorage.setItem('session_expired', 'true');
@@ -1363,16 +1375,28 @@ export const useAuthStore = create<AuthState>()(
 
         notifyParent('sso:logout');
 
-        // Background cookie/token cleanup - keepalive ensures completion during navigation
+        let endSessionUrl: string | undefined;
+        // Complete cookie/token cleanup before navigating so the OAuth response
+        // can hand the browser to the provider's end-session endpoint.
         if (!wasDemoMode) {
-          apiFetch(`/api/auth/session?slot=${slot}`, { method: 'DELETE', keepalive: true }).catch(() => {});
+          const sessionCleanup = apiFetch(`/api/auth/session?slot=${slot}`, {
+            method: 'DELETE', keepalive: true,
+          }).catch(() => null);
           if (wasOAuth) {
-            apiFetch(`/api/auth/token?slot=${slot}`, { method: 'DELETE', keepalive: true }).catch(() => {});
+            const tokenCleanup = apiFetch(`/api/auth/token?slot=${slot}`, {
+              method: 'DELETE', keepalive: true,
+            }).catch(() => null);
+            const [, response] = await Promise.all([sessionCleanup, tokenCleanup]);
+            if (response?.ok) {
+              const body = await response.json().catch(() => null);
+              if (typeof body?.end_session_url === 'string') endSessionUrl = body.end_session_url;
+            }
+          } else {
+            await sessionCleanup;
           }
         }
 
-        // Redirect to login - this is synchronous and happens AFTER all state is cleared
-        redirectToLogin();
+        redirectAfterLogout(endSessionUrl);
       },
 
       // Remove a specific (typically non-active) account: tear down its client,
@@ -1430,11 +1454,12 @@ export const useAuthStore = create<AuthState>()(
           accountId: 'all'
         });
 
-        // Background cookie/token cleanup
-        apiFetch('/api/auth/session?all=true', { method: 'DELETE', keepalive: true }).catch(() => {});
-        apiFetch('/api/auth/token?all=true', { method: 'DELETE', keepalive: true }).catch(() => {});
-
-        redirectToLogin();
+        const [, tokenResponse] = await Promise.all([
+          apiFetch('/api/auth/session?all=true', { method: 'DELETE', keepalive: true }).catch(() => null),
+          apiFetch('/api/auth/token?all=true', { method: 'DELETE', keepalive: true }).catch(() => null),
+        ]);
+        const tokenBody = tokenResponse?.ok ? await tokenResponse.json().catch(() => null) : null;
+        redirectAfterLogout(typeof tokenBody?.end_session_url === 'string' ? tokenBody.end_session_url : undefined);
       },
 
       switchAccount: async (accountId: string) => {

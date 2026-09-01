@@ -7,6 +7,7 @@ import {
   parseAppFrameOrigins,
 } from "./lib/security/app-frame-origins";
 import { configManager } from "./lib/admin/config-manager";
+import { parseJmapServers } from "./lib/admin/jmap-servers";
 import { detectSetupState } from "./lib/setup/state";
 
 const intlMiddleware = createIntlMiddleware(routing);
@@ -122,6 +123,34 @@ export async function proxy(request: NextRequest) {
 
   if (PROXY_SKIP_PATTERN.test(pathname)) {
     return NextResponse.next();
+  }
+
+  // Start automatic SSO at the server boundary. Doing this in the login
+  // page's client effect lets stale sessionStorage, an old service worker, or
+  // a failed hydration suppress the redirect and expose the intermediate
+  // Bulwark login page. Explicit error and account-management states must
+  // remain interactive so users are not trapped in a redirect loop.
+  const loginLocale = (routing.locales as readonly string[]).find(
+    (locale) => pathname === `/${locale}/login`,
+  );
+  const shouldAutoStartSso =
+    loginLocale !== undefined &&
+    configManager.get<boolean>('oauthEnabled', false) &&
+    configManager.get<boolean>('oauthOnly', false) &&
+    configManager.get<boolean>('autoSsoEnabled', false) &&
+    parseJmapServers(configManager.get<unknown>('jmapServers', [])).length <= 1 &&
+    request.nextUrl.searchParams.get('logged_out') !== '1' &&
+    !request.nextUrl.searchParams.has('sso_error') &&
+    request.nextUrl.searchParams.get('mode') !== 'add-account' &&
+    !request.nextUrl.searchParams.has('mobile_redirect_uri');
+
+  if (shouldAutoStartSso) {
+    const url = request.nextUrl.clone();
+    url.pathname = '/api/auth/sso/start';
+    url.search = '';
+    url.searchParams.set('locale', loginLocale);
+    url.searchParams.set('return', 'redirect');
+    return NextResponse.redirect(url);
   }
 
   const nonce = crypto.randomUUID();
