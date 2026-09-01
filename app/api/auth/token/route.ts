@@ -5,6 +5,7 @@ import {
   refreshTokenCookieName,
   refreshTokenServerCookieName,
   accessTokenCookieName,
+  idTokenCookieName,
   encodeCachedAccessToken,
   decodeCachedAccessToken,
 } from '@/lib/oauth/tokens';
@@ -23,7 +24,10 @@ function getSlot(request: NextRequest): number {
 
 type CookieStore = Awaited<ReturnType<typeof cookies>>;
 
-async function discoverEndSessionUrl(serverId?: string | null): Promise<string | undefined> {
+async function discoverEndSessionUrl(
+  serverId?: string | null,
+  idTokenHint?: string,
+): Promise<string | undefined> {
   const postLogoutRedirectUri = process.env.OAUTH_POST_LOGOUT_REDIRECT_URI?.trim();
   if (!postLogoutRedirectUri) return undefined;
 
@@ -36,7 +40,12 @@ async function discoverEndSessionUrl(serverId?: string | null): Promise<string |
   if (!metadata?.end_session_endpoint) return undefined;
 
   const { clientId } = getRequiredConfig(serverId, { fallbackClientId: DEFAULT_CLIENT_ID });
-  const result = buildEndSessionUrl(metadata.end_session_endpoint, clientId, postLogoutRedirectUri);
+  const result = buildEndSessionUrl(
+    metadata.end_session_endpoint,
+    clientId,
+    postLogoutRedirectUri,
+    idTokenHint,
+  );
   if (!result) logger.warn('Ignoring invalid OAuth logout configuration');
   return result;
 }
@@ -63,6 +72,44 @@ function cacheAccessToken(
   cookieStore.set(name, value, { ...getCookieOptions(), maxAge: expiresIn });
 }
 
+/**
+ * Sessions created before ID-token persistence was added still have a valid
+ * refresh token. One best-effort refresh recovers the standards-based logout
+ * hint and, when rotation is enabled, the token that must then be revoked.
+ */
+async function recoverLogoutTokens(
+  refreshToken: string,
+  tokenEndpoint: string,
+  serverId?: string | null,
+): Promise<{ idTokenHint?: string; refreshToken: string }> {
+  try {
+    const params = buildOAuthParams({
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+    }, serverId, { fallbackClientId: DEFAULT_CLIENT_ID });
+    const response = await fetch(tokenEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    if (!response.ok) return { refreshToken };
+    const tokens = await response.json();
+    return {
+      refreshToken: typeof tokens.refresh_token === 'string'
+        ? tokens.refresh_token
+        : refreshToken,
+      ...(typeof tokens.id_token === 'string' && tokens.id_token
+        ? { idTokenHint: tokens.id_token }
+        : {}),
+    };
+  } catch (err) {
+    logger.warn('Failed to recover ID token during logout', {
+      error: err instanceof Error ? err.message : 'Unknown error',
+    });
+    return { refreshToken };
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const { code, code_verifier, redirect_uri, slot: bodySlot, server_id: bodyServerId } = await request.json();
@@ -85,6 +132,11 @@ export async function POST(request: NextRequest) {
     if (tokens.refresh_token) {
       const cookieName = refreshTokenCookieName(slot);
       cookieStore.set(cookieName, tokens.refresh_token, getCookieOptions());
+    }
+    if (tokens.id_token) {
+      cookieStore.set(idTokenCookieName(slot), tokens.id_token, getCookieOptions());
+    } else {
+      cookieStore.delete(idTokenCookieName(slot));
     }
     cacheAccessToken(cookieStore, slot, tokens.access_token, tokens.expires_in || 3600);
     // Persist which server entry minted this refresh token so the PUT/DELETE
@@ -114,6 +166,7 @@ export async function PUT(request: NextRequest) {
 
     if (!refreshToken) {
       cookieStore.delete(accessTokenCookieName(slot));
+      cookieStore.delete(idTokenCookieName(slot));
       return NextResponse.json({ error: 'No refresh token' }, { status: 401 });
     }
 
@@ -163,6 +216,7 @@ export async function PUT(request: NextRequest) {
         cookieStore.delete(cookieName);
         cookieStore.delete(refreshTokenServerCookieName(slot));
         cookieStore.delete(accessTokenCookieName(slot));
+        cookieStore.delete(idTokenCookieName(slot));
         return NextResponse.json({ error: 'Refresh failed' }, { status: 401 });
       }
       return NextResponse.json({ error: 'Token endpoint unavailable' }, { status: 503 });
@@ -177,6 +231,9 @@ export async function PUT(request: NextRequest) {
 
     if (tokens.refresh_token) {
       cookieStore.set(cookieName, tokens.refresh_token, getCookieOptions());
+    }
+    if (tokens.id_token) {
+      cookieStore.set(idTokenCookieName(slot), tokens.id_token, getCookieOptions());
     }
 
     const expiresIn = tokens.expires_in || 3600;
@@ -199,11 +256,18 @@ export async function DELETE(request: NextRequest) {
     if (all) {
       // Revoke and delete all refresh token cookies across every slot.
       const cookieStore = await cookies();
+      let logoutServerId: string | null = null;
+      let idTokenHint: string | undefined;
       for (let i = 0; i < MAX_ACCOUNT_SLOTS; i++) {
         const name = refreshTokenCookieName(i);
         const serverCookieName = refreshTokenServerCookieName(i);
         const token = cookieStore.get(name)?.value;
         const slotServerId = cookieStore.get(serverCookieName)?.value || null;
+        const slotIdToken = cookieStore.get(idTokenCookieName(i))?.value;
+        if (!idTokenHint && slotIdToken) {
+          idTokenHint = slotIdToken;
+          logoutServerId = slotServerId;
+        }
         if (token) {
           // Best-effort revocation
           try {
@@ -221,8 +285,9 @@ export async function DELETE(request: NextRequest) {
         }
         cookieStore.delete(serverCookieName);
         cookieStore.delete(accessTokenCookieName(i));
+        cookieStore.delete(idTokenCookieName(i));
       }
-      const end_session_url = await discoverEndSessionUrl();
+      const end_session_url = await discoverEndSessionUrl(logoutServerId, idTokenHint);
       return NextResponse.json({ ok: true, ...(end_session_url && { end_session_url }) });
     }
 
@@ -230,6 +295,7 @@ export async function DELETE(request: NextRequest) {
     const cookieName = refreshTokenCookieName(slot);
     const cookieStore = await cookies();
     const refreshToken = cookieStore.get(cookieName)?.value;
+    let idTokenHint = cookieStore.get(idTokenCookieName(slot))?.value;
     const slotServerId = cookieStore.get(refreshTokenServerCookieName(slot))?.value || null;
     const metadata = await getMetadata(slotServerId, { fallbackClientId: DEFAULT_CLIENT_ID }).catch((err) => {
       logger.warn('Failed to discover OAuth metadata during logout', {
@@ -239,9 +305,19 @@ export async function DELETE(request: NextRequest) {
     });
 
     if (refreshToken) {
+      let tokenToRevoke = refreshToken;
+      if (!idTokenHint && metadata?.token_endpoint) {
+        const recovered = await recoverLogoutTokens(
+          refreshToken,
+          metadata.token_endpoint,
+          slotServerId,
+        );
+        idTokenHint = recovered.idTokenHint;
+        tokenToRevoke = recovered.refreshToken;
+      }
       if (metadata?.revocation_endpoint) {
         const params = buildOAuthParams({
-          token: refreshToken,
+          token: tokenToRevoke,
           token_type_hint: 'refresh_token',
         }, slotServerId, { fallbackClientId: DEFAULT_CLIENT_ID });
 
@@ -263,6 +339,7 @@ export async function DELETE(request: NextRequest) {
     }
     cookieStore.delete(refreshTokenServerCookieName(slot));
     cookieStore.delete(accessTokenCookieName(slot));
+    cookieStore.delete(idTokenCookieName(slot));
 
     const postLogoutRedirectUri = process.env.OAUTH_POST_LOGOUT_REDIRECT_URI?.trim();
     const end_session_url = metadata?.end_session_endpoint && postLogoutRedirectUri
@@ -270,6 +347,7 @@ export async function DELETE(request: NextRequest) {
           metadata.end_session_endpoint,
           getRequiredConfig(slotServerId, { fallbackClientId: DEFAULT_CLIENT_ID }).clientId,
           postLogoutRedirectUri,
+          idTokenHint,
         )
       : undefined;
 

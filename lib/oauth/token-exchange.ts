@@ -106,6 +106,7 @@ export interface TokenResult {
   access_token: string;
   expires_in: number;
   refresh_token?: string;
+  id_token?: string;
 }
 
 export async function exchangeCodeForTokens(
@@ -146,5 +147,6 @@ export async function exchangeCodeForTokens(
     access_token: tokens.access_token,
     expires_in: tokens.expires_in || 3600,
     refresh_token: tokens.refresh_token,
+    id_token: tokens.id_token,
   };
 }

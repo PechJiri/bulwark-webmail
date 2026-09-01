@@ -21,10 +21,14 @@ vi.mock('@/lib/oauth/cookie-config', () => ({
 
 const getTokenEndpoint = vi.fn();
 const buildOAuthParams = vi.fn();
+const exchangeCodeForTokens = vi.fn();
+const getMetadata = vi.fn();
+const getRequiredConfig = vi.fn();
 vi.mock('@/lib/oauth/token-exchange', () => ({
-  exchangeCodeForTokens: vi.fn(),
+  exchangeCodeForTokens: (...args: unknown[]) => exchangeCodeForTokens(...args),
   buildOAuthParams: (...args: unknown[]) => buildOAuthParams(...args),
-  getMetadata: vi.fn().mockResolvedValue(null),
+  getMetadata: (...args: unknown[]) => getMetadata(...args),
+  getRequiredConfig: (...args: unknown[]) => getRequiredConfig(...args),
   getTokenEndpoint: (...args: unknown[]) => getTokenEndpoint(...args),
   DEFAULT_CLIENT_ID: 'bulwark-webmail',
 }));
@@ -57,9 +61,34 @@ function mockRequest(params: Record<string, string> = {}): unknown {
   };
 }
 
+function mockJsonRequest(body: Record<string, unknown>, params: Record<string, string> = {}): unknown {
+  return {
+    ...mockRequest(params) as Record<string, unknown>,
+    json: async () => body,
+  };
+}
+
 async function callPut(params?: Record<string, string>) {
   const { PUT } = await import('@/app/api/auth/token/route');
   const res = (await PUT(mockRequest(params) as Parameters<typeof PUT>[0])) as unknown as {
+    status: number;
+    json: () => Promise<Record<string, unknown>>;
+  };
+  return { status: res.status, body: await res.json() };
+}
+
+async function callPost(body: Record<string, unknown>, params?: Record<string, string>) {
+  const { POST } = await import('@/app/api/auth/token/route');
+  const res = (await POST(mockJsonRequest(body, params) as Parameters<typeof POST>[0])) as unknown as {
+    status: number;
+    json: () => Promise<Record<string, unknown>>;
+  };
+  return { status: res.status, body: await res.json() };
+}
+
+async function callDelete(params?: Record<string, string>) {
+  const { DELETE } = await import('@/app/api/auth/token/route');
+  const res = (await DELETE(mockRequest(params) as Parameters<typeof DELETE>[0])) as unknown as {
     status: number;
     json: () => Promise<Record<string, unknown>>;
   };
@@ -78,6 +107,8 @@ describe('oauth token route - access token cache (#552)', () => {
     vi.clearAllMocks();
     cookieStore = new FakeCookies();
     getTokenEndpoint.mockResolvedValue('https://auth.example.com/token');
+    getMetadata.mockResolvedValue(null);
+    getRequiredConfig.mockReturnValue({ clientId: 'family-bulwark' });
     buildOAuthParams.mockReturnValue(new URLSearchParams({ grant_type: 'refresh_token' }));
     vi.stubGlobal('fetch', fetchMock);
   });
@@ -247,5 +278,97 @@ describe('oauth token route - access token cache (#552)', () => {
 
     expect(status).toBe(401);
     expect(cookieStore.deleted).toContain('jmap_at');
+  });
+
+  it('stores the ID token returned by the authorization-code exchange', async () => {
+    exchangeCodeForTokens.mockResolvedValue({
+      access_token: 'access-token',
+      refresh_token: 'refresh-token',
+      id_token: 'signed-keycloak-id-token',
+      expires_in: 3600,
+    });
+
+    const { status } = await callPost({
+      code: 'authorization-code',
+      code_verifier: 'pkce-verifier',
+      redirect_uri: 'https://webmail.pechovic.cz/cs/auth/callback',
+    });
+
+    expect(status).toBe(200);
+    expect(cookieStore.get('jmap_it')?.value).toBe('signed-keycloak-id-token');
+  });
+
+  it('updates the stored ID token when the provider returns one during refresh', async () => {
+    cookieStore.set('jmap_rt', 'refresh-token');
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: 'fresh-token',
+        id_token: 'refreshed-keycloak-id-token',
+        expires_in: 1800,
+      }),
+    });
+
+    const { status } = await callPut({ force: 'true' });
+
+    expect(status).toBe(200);
+    expect(cookieStore.get('jmap_it')?.value).toBe('refreshed-keycloak-id-token');
+  });
+
+  it('uses and deletes the stored ID token during RP-initiated logout', async () => {
+    vi.stubEnv('OAUTH_POST_LOGOUT_REDIRECT_URI', 'https://webmail.pechovic.cz/cs/login');
+    cookieStore.set('jmap_rt', 'refresh-token');
+    cookieStore.set('jmap_it', 'signed-keycloak-id-token');
+    getMetadata.mockResolvedValue({
+      revocation_endpoint: 'https://sso.pechovic.cz/realms/pechovic/protocol/openid-connect/revoke',
+      end_session_endpoint: 'https://sso.pechovic.cz/realms/pechovic/protocol/openid-connect/logout',
+    });
+    fetchMock.mockResolvedValue({ ok: true });
+
+    const { status, body } = await callDelete();
+
+    expect(status).toBe(200);
+    const logoutUrl = new URL(body.end_session_url as string);
+    expect(logoutUrl.searchParams.get('id_token_hint')).toBe('signed-keycloak-id-token');
+    expect(cookieStore.deleted).toContain('jmap_it');
+  });
+
+  it('recovers an ID-token hint from the refresh token for sessions created before the fix', async () => {
+    vi.stubEnv('OAUTH_POST_LOGOUT_REDIRECT_URI', 'https://webmail.pechovic.cz/cs/login');
+    cookieStore.set('jmap_rt', 'pre-fix-refresh-token');
+    getMetadata.mockResolvedValue({
+      token_endpoint: 'https://sso.pechovic.cz/realms/pechovic/protocol/openid-connect/token',
+      revocation_endpoint: 'https://sso.pechovic.cz/realms/pechovic/protocol/openid-connect/revoke',
+      end_session_endpoint: 'https://sso.pechovic.cz/realms/pechovic/protocol/openid-connect/logout',
+    });
+    buildOAuthParams.mockImplementation((base: Record<string, string>) => new URLSearchParams(base));
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          access_token: 'unused-access-token',
+          refresh_token: 'rotated-refresh-token',
+          id_token: 'recovered-keycloak-id-token',
+        }),
+      })
+      .mockResolvedValueOnce({ ok: true });
+
+    const { status, body } = await callDelete();
+
+    expect(status).toBe(200);
+    const logoutUrl = new URL(body.end_session_url as string);
+    expect(logoutUrl.searchParams.get('id_token_hint')).toBe('recovered-keycloak-id-token');
+    expect(buildOAuthParams).toHaveBeenNthCalledWith(
+      1,
+      { grant_type: 'refresh_token', refresh_token: 'pre-fix-refresh-token' },
+      null,
+      { fallbackClientId: 'bulwark-webmail' },
+    );
+    expect(buildOAuthParams).toHaveBeenNthCalledWith(
+      2,
+      { token: 'rotated-refresh-token', token_type_hint: 'refresh_token' },
+      null,
+      { fallbackClientId: 'bulwark-webmail' },
+    );
   });
 });

@@ -7,7 +7,11 @@ import {
   getRequiredConfig,
   getTokenEndpoint,
 } from '@/lib/oauth/token-exchange';
-import { refreshTokenCookieName, refreshTokenServerCookieName } from '@/lib/oauth/tokens';
+import {
+  idTokenCookieName,
+  refreshTokenCookieName,
+  refreshTokenServerCookieName,
+} from '@/lib/oauth/tokens';
 import { getCookieOptions } from '@/lib/oauth/cookie-config';
 
 const SSO_PENDING_COOKIE = 'sso_pending';
@@ -82,6 +86,11 @@ export async function POST(request: NextRequest) {
       if (tokens.refresh_token) {
         const cookieName = refreshTokenCookieName(slot);
         cookieStore.set(cookieName, tokens.refresh_token, getCookieOptions());
+      }
+      if (tokens.id_token) {
+        cookieStore.set(idTokenCookieName(slot), tokens.id_token, getCookieOptions());
+      } else {
+        cookieStore.delete(idTokenCookieName(slot));
       }
       const serverCookieName = refreshTokenServerCookieName(slot);
       if (pendingServerId) {

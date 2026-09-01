@@ -25,7 +25,13 @@ vi.mock('@/lib/admin/config-manager', () => ({
   },
 }));
 
-import { getRequiredConfig, buildOAuthParams, DEFAULT_CLIENT_ID } from '@/lib/oauth/token-exchange';
+import { discoverOAuth } from '@/lib/oauth/discovery';
+import {
+  getRequiredConfig,
+  buildOAuthParams,
+  exchangeCodeForTokens,
+  DEFAULT_CLIENT_ID,
+} from '@/lib/oauth/token-exchange';
 
 describe('token-exchange client id fallback (#873)', () => {
   beforeEach(() => {
@@ -65,5 +71,43 @@ describe('token-exchange client id fallback (#873)', () => {
     );
     expect(params.get('client_id')).toBe('bulwark-webmail');
     expect(params.get('grant_type')).toBe('refresh_token');
+  });
+});
+
+describe('authorization-code token exchange', () => {
+  beforeEach(() => {
+    vi.stubEnv('JMAP_SERVER_URL', 'https://mail.example.com');
+    vi.stubEnv('OAUTH_CLIENT_ID', 'family-bulwark');
+    vi.stubEnv('OAUTH_ISSUER_URL', 'https://sso.pechovic.cz/realms/pechovic');
+    vi.mocked(discoverOAuth).mockResolvedValue({
+      issuer: 'https://sso.pechovic.cz/realms/pechovic',
+      authorization_endpoint: 'https://sso.pechovic.cz/realms/pechovic/protocol/openid-connect/auth',
+      token_endpoint: 'https://sso.pechovic.cz/realms/pechovic/protocol/openid-connect/token',
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  it('preserves the ID token needed to terminate the matching browser SSO session', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: 'access-token',
+        refresh_token: 'refresh-token',
+        id_token: 'signed-keycloak-id-token',
+        expires_in: 3600,
+      }),
+    }));
+
+    const tokens = await exchangeCodeForTokens(
+      'authorization-code',
+      'pkce-verifier',
+      'https://webmail.pechovic.cz/cs/auth/callback',
+    );
+
+    expect(tokens.id_token).toBe('signed-keycloak-id-token');
   });
 });

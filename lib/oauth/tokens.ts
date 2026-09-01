@@ -18,6 +18,7 @@ export function getOauthScopes(): string {
 export const REFRESH_TOKEN_COOKIE = 'jmap_rt';
 export const REFRESH_TOKEN_SERVER_COOKIE = 'jmap_rts';
 export const ACCESS_TOKEN_COOKIE = 'jmap_at';
+export const ID_TOKEN_COOKIE = 'jmap_it';
 
 /** Get the cookie name for a given account slot. Slot 0 uses the legacy name. */
 export function refreshTokenCookieName(slot: number): string {
@@ -35,6 +36,11 @@ export function refreshTokenServerCookieName(slot: number): string {
  */
 export function accessTokenCookieName(slot: number): string {
   return slot === 0 ? ACCESS_TOKEN_COOKIE : `${ACCESS_TOKEN_COOKIE}_${slot}`;
+}
+
+/** ID token used only as the OIDC RP-initiated logout hint for this slot. */
+export function idTokenCookieName(slot: number): string {
+  return slot === 0 ? ID_TOKEN_COOKIE : `${ID_TOKEN_COOKIE}_${slot}`;
 }
 
 /**
