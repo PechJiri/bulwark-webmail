@@ -29,11 +29,14 @@ jobs:
     steps:
       - name: Set image name
         id: set
+        env:
+          REPOSITORY: ${{ github.repository }}
         run: |
+          repository="$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
           if [ "${{ github.ref_name }}" = "main" ]; then
-            echo "image_name=ghcr.io/${{ github.repository }}-beta" >> $GITHUB_OUTPUT
+            echo "image_name=ghcr.io/${repository}-beta" >> "$GITHUB_OUTPUT"
           else
-            echo "image_name=ghcr.io/${{ github.repository }}-${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "image_name=ghcr.io/${repository}-${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
           fi
 
   build:
