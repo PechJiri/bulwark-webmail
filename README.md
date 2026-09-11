@@ -166,6 +166,8 @@ AUTO_SSO_ENABLED=true             # skip the login form, go straight to the IdP
 
 Endpoints are auto-discovered via `.well-known/oauth-authorization-server` or `.well-known/openid-configuration`. `OAUTH_ALLOW_PRIVATE_ENDPOINTS` is off by default as an SSRF guard. Enable it only for split-DNS deployments where the issuer's public hostname resolves to an internal IP.
 
+If a browser SSO callback has lost its pending transaction or exceeded its five-minute lifetime, the webmail starts a fresh login once instead of replaying the old authorization code. A second failure stays on the error screen; **Back to login** explicitly starts a new attempt. State mismatches and token-exchange failures are not automatically retried. Pairing, mobile handoff and add-account callbacks keep their existing flows. The recovery does not extend token lifetimes or bypass state/PKCE validation.
+
 </details>
 
 <details>

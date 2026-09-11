@@ -37,7 +37,7 @@ export async function POST(request: NextRequest) {
     const pendingCookie = cookieStore.get(SSO_PENDING_COOKIE)?.value;
     if (!pendingCookie) {
       logger.warn('SSO complete: no pending cookie found');
-      return NextResponse.json({ error: 'No pending SSO session. Please start the login flow again.' }, { status: 400 });
+      return NextResponse.json({ error: 'No pending SSO session. Please start the login flow again.', error_code: 'sso_session_missing' }, { status: 400 });
     }
 
     const pending = decryptPayload(pendingCookie);
@@ -58,7 +58,7 @@ export async function POST(request: NextRequest) {
     if (!createdAt || Date.now() - createdAt > SSO_PENDING_MAX_AGE_MS) {
       logger.warn('SSO complete: pending session expired');
       cookieStore.delete(SSO_PENDING_COOKIE);
-      return NextResponse.json({ error: 'SSO session expired. Please try again.' }, { status: 400 });
+      return NextResponse.json({ error: 'SSO session expired. Please try again.', error_code: 'sso_session_expired' }, { status: 400 });
     }
 
     const codeVerifier = pending.code_verifier as string;

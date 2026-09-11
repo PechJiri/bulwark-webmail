@@ -4,7 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useAuthStore } from "@/stores/auth-store";
-import { apiFetch, getPathPrefix, toRouterPath } from "@/lib/browser-navigation";
+import { apiFetch, getPathPrefix, toRouterPath, replaceWindowLocation } from "@/lib/browser-navigation";
 import { buildSettingsPath } from "@/lib/deep-links";
 import { Loader2, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -186,6 +186,7 @@ function OAuthCallbackInner() {
           if (success) {
             let redirectTo = `${ssoPrefix}/${params.locale}`;
             try {
+              sessionStorage.removeItem('sso_recovery_attempted');
               const saved = sessionStorage.getItem('redirect_after_login');
               if (saved) {
                 sessionStorage.removeItem('redirect_after_login');
@@ -194,6 +195,22 @@ function OAuthCallbackInner() {
             } catch { /* sessionStorage may be unavailable */ }
             router.push(toRouterPath(redirectTo));
           } else {
+            // A consumed/expired pending cookie cannot be repaired by replaying
+            // this authorization code. Start a fresh login once, keeping the
+            // server's state, PKCE and expiry checks intact. Storage failure
+            // fails closed to the normal error screen instead of risking a loop.
+            const reason = useAuthStore.getState().error;
+            if (reason === 'sso_session_missing' || reason === 'sso_session_expired') {
+              try {
+                if (!sessionStorage.getItem('sso_recovery_attempted')
+                    && !sessionStorage.getItem('oauth_add_account_mode')) {
+                  sessionStorage.setItem('sso_recovery_attempted', '1');
+                  sessionStorage.removeItem('sso_attempted');
+                  replaceWindowLocation(`${ssoPrefix}/${params.locale}/login`);
+                  return;
+                }
+              } catch { /* keep the existing error UI */ }
+            }
             setError("token_exchange_failed");
           }
         })
@@ -220,7 +237,13 @@ function OAuthCallbackInner() {
           </p>
           <Button
             variant="outline"
-            onClick={() => router.push(toRouterPath(`${getPathPrefix(params.locale as string)}/${params.locale}/login`))}
+            onClick={() => {
+              try {
+                sessionStorage.removeItem('sso_recovery_attempted');
+                sessionStorage.removeItem('sso_attempted');
+              } catch { /* explicit navigation still works without storage */ }
+              replaceWindowLocation(`${getPathPrefix(params.locale as string)}/${params.locale}/login`);
+            }}
           >
             {t("oauth_error.back_to_login")}
           </Button>

@@ -78,4 +78,39 @@ describe('server-side SSO completion', () => {
     expect(response.status).toBe(200);
     expect(cookieStore.get('jmap_it')?.value).toBe('signed-keycloak-id-token');
   });
+
+  it('identifies a missing transaction for fresh login without exchanging its code', async () => {
+    cookieStore.delete('sso_pending');
+    const { POST } = await import('@/app/api/auth/sso/complete/route');
+    const response = await POST({
+      json: async () => ({ code: 'old-code', state: 'expected-state' }),
+    } as Parameters<typeof POST>[0]);
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error_code: 'sso_session_missing' });
+    expect(exchangeCodeForTokens).not.toHaveBeenCalled();
+    expect(cookieStore.get('jmap_rt')).toBeUndefined();
+  });
+
+  it('identifies an expired transaction without extending its five-minute lifetime', async () => {
+    decryptPayload.mockReturnValue({ state: 'expected-state', created_at: Date.now() - 300001 });
+    const { POST } = await import('@/app/api/auth/sso/complete/route');
+    const response = await POST({
+      json: async () => ({ code: 'old-code', state: 'expected-state' }),
+    } as Parameters<typeof POST>[0]);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error_code: 'sso_session_expired' });
+    expect(exchangeCodeForTokens).not.toHaveBeenCalled();
+    expect(cookieStore.get('sso_pending')).toBeUndefined();
+  });
+
+  it('does not classify a state mismatch as recoverable or exchange its code', async () => {
+    const { POST } = await import('@/app/api/auth/sso/complete/route');
+    const response = await POST({
+      json: async () => ({ code: 'old-code', state: 'wrong-state' }),
+    } as Parameters<typeof POST>[0]);
+    expect(response.status).toBe(400);
+    expect((await response.json()).error_code).toBeUndefined();
+    expect(exchangeCodeForTokens).not.toHaveBeenCalled();
+  });
 });

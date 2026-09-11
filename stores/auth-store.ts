@@ -1085,6 +1085,10 @@ export const useAuthStore = create<AuthState>()(
 
           if (!ssoRes.ok) {
             const errorData = await ssoRes.json().catch(() => ({ error: 'token_exchange_failed' }));
+            if (ssoRes.status === 400 && (errorData.error_code === 'sso_session_missing'
+                || errorData.error_code === 'sso_session_expired')) {
+              throw new Error(errorData.error_code);
+            }
             throw new Error(errorData.error || 'token_exchange_failed');
           }
 
