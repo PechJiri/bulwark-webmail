@@ -12,7 +12,7 @@
 # Build context is the repo root (see docker-compose.yml `context: ..`), so the
 # root .dockerignore keeps examples/, integration/ and node_modules out.
 
-FROM node:24-alpine
+FROM node:24.21.0-alpine@sha256:be80f76cf40ec8e42b9bec49f60a55e0660f30af58d3e5a25530785b30ea67e2
 WORKDIR /app
 
 # Install dependencies first for layer caching.
