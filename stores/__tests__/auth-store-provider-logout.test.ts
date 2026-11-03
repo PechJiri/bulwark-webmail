@@ -161,7 +161,7 @@ describe('single-account sign-out and the identity provider', () => {
 
     await useAuthStore.getState().logout();
 
-    expect(replaceSpy).toHaveBeenCalledWith('/en/login');
+    expect(replaceSpy).toHaveBeenCalledWith('/en/login?logged_out=1');
     expect(sessionStorage.getItem('signed_out')).toBe('true');
   });
 
@@ -179,7 +179,7 @@ describe('single-account sign-out and the identity provider', () => {
     await useAuthStore.getState().logout();
 
     expect(replaceSpy).toHaveBeenCalledTimes(1);
-    expect(replaceSpy).toHaveBeenCalledWith('/en/login');
+    expect(replaceSpy).toHaveBeenCalledWith('/en/login?logged_out=1');
   });
 
   it('leaves the provider alone when the session expired on its own', async () => {
@@ -210,7 +210,7 @@ describe('single-account sign-out and the identity provider', () => {
     await useAuthStore.getState().logout();
 
     expect(calls).toEqual(['DELETE /api/auth/session?slot=0', 'DELETE /api/auth/token?slot=0']);
-    expect(replaceSpy).toHaveBeenCalledWith('/en/login');
+    expect(replaceSpy).toHaveBeenCalledWith('/en/login?logged_out=1');
   });
 
   it('leaves the provider to the embedding portal', async () => {
@@ -236,7 +236,7 @@ describe('single-account sign-out and the identity provider', () => {
     await useAuthStore.getState().logout();
 
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('/api/auth/token?slot=0&end_session=true: HTTP 500'));
-    expect(replaceSpy).toHaveBeenCalledWith('/en/login');
+    expect(replaceSpy).toHaveBeenCalledWith('/en/login?logged_out=1');
     expect(useAuthStore.getState().isAuthenticated).toBe(false);
   });
 
@@ -252,7 +252,7 @@ describe('single-account sign-out and the identity provider', () => {
     await vi.advanceTimersByTimeAsync(8_000);
     await signedOut;
 
-    expect(replaceSpy).toHaveBeenCalledWith('/en/login');
+    expect(replaceSpy).toHaveBeenCalledWith('/en/login?logged_out=1');
     expect(useAuthStore.getState().isAuthenticated).toBe(false);
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('finishing it in the background'));
     // keepalive lets the requests outlive the navigation.
@@ -379,7 +379,7 @@ describe('signing out of several accounts', () => {
     await useAuthStore.getState().logoutAll();
 
     expect(calls).toEqual(['DELETE /api/auth/session?all=true', 'DELETE /api/auth/token?all=true']);
-    expect(replaceSpy).toHaveBeenCalledWith('/en/login');
+    expect(replaceSpy).toHaveBeenCalledWith('/en/login?logged_out=1');
   });
 
   it('leaves every provider session alone for a sign-out the session limits made', async () => {
@@ -392,7 +392,7 @@ describe('signing out of several accounts', () => {
     await useAuthStore.getState().logoutAll({ endProviderSession: false });
 
     expect(calls).toEqual(['DELETE /api/auth/session?all=true', 'DELETE /api/auth/token?all=true']);
-    expect(replaceSpy).toHaveBeenCalledWith('/en/login');
+    expect(replaceSpy).toHaveBeenCalledWith('/en/login?logged_out=1');
     expect(useAccountStore.getState().accounts).toEqual([]);
     // The login page shows the form rather than signing straight back in.
     expect(consumeSignedOut()).toBe(true);

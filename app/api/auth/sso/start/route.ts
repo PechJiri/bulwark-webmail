@@ -215,10 +215,14 @@ export async function GET(request: NextRequest) {
     headers.set('origin', publicBase.origin);
     headers.set('host', publicBase.host);
     headers.set('sec-fetch-site', 'same-origin');
-    const internalRequest = new NextRequest(request, {
+    // Next's route request may be a runtime wrapper rather than a native
+    // Request instance. Reconstruct from its URL string so NextRequest does
+    // not inspect branded/private Request state on that wrapper.
+    const internalRequest = new NextRequest(request.url, {
       method: 'POST',
       headers,
       body: JSON.stringify({ redirect_uri: redirectUri, locale }),
+      nextConfig: request.nextUrl.basePath ? { basePath: request.nextUrl.basePath } : undefined,
     });
     const response = await POST(internalRequest);
     if (!response.ok) return response;

@@ -84,10 +84,17 @@ describe('GET /api/auth/sso/start', () => {
   });
 
   it('includes the configured mount prefix once in the localized callback', async () => {
-    const request = new NextRequest(
+    const original = new NextRequest(
       'https://webmail.example.com/webmail/api/auth/sso/start?locale=cs&return=redirect',
       { nextConfig: { basePath: '/webmail' } },
     );
+    // Model Next's route wrapper: it exposes URL/header data but is not itself
+    // a native Request branded for the current NextRequest constructor.
+    const request = {
+      url: original.url,
+      headers: original.headers,
+      nextUrl: original.nextUrl,
+    } as NextRequest;
     const response = await GET(request);
 
     expect(response.status).toBe(307);
