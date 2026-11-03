@@ -37,6 +37,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check pinned container base images
+        run: node --test tests/container-base-contract.test.mjs
+
       - name: Run test suite
         # forks + a small worker count keeps the load-sensitive component tests
         # from timing out on the shared runners; the longer per-test timeout
