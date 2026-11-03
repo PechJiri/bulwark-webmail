@@ -607,6 +607,7 @@ function LoginPageContent() {
 
   // Auto-SSO: when enabled with OAUTH_ONLY, skip the login page entirely
   const ssoError = searchParams.get("sso_error");
+  const loggedOutByQuery = searchParams.get("logged_out") === "1";
   const autoSsoTriggered = useRef(false);
   // Read once per mount: a ref survives the effect re-runs, the flag does not.
   const signedOutOnPurpose = useRef<boolean | null>(null);
@@ -673,7 +674,11 @@ function LoginPageContent() {
   useEffect(() => {
     // After signing out, show the login page rather than signing straight
     // back in through a provider session that outlived the sign-out (#905).
-    if (signedOutOnPurpose.current === null) signedOutOnPurpose.current = consumeSignedOut();
+    if (signedOutOnPurpose.current === null) {
+      // The URL carries logout intent across a new tab and storage failures;
+      // the sessionStorage marker remains a fallback for existing callers.
+      signedOutOnPurpose.current = loggedOutByQuery || consumeSignedOut();
+    }
     if (signedOutOnPurpose.current) return;
     if (!autoSsoEnabled || !oauthOnly || !oauthDiscoveryDone || !oauthMetadata) return;
     if (ssoError || isAddAccountMode || isAuthenticated) return;
@@ -693,7 +698,7 @@ function LoginPageContent() {
 
     autoSsoTriggered.current = true;
     startServerSideSso();
-  }, [autoSsoEnabled, oauthOnly, oauthDiscoveryDone, oauthMetadata, ssoError, isAddAccountMode, isAuthenticated, jmapServers.length, startServerSideSso]);
+  }, [autoSsoEnabled, oauthOnly, oauthDiscoveryDone, oauthMetadata, ssoError, loggedOutByQuery, isAddAccountMode, isAuthenticated, jmapServers.length, startServerSideSso]);
 
   const handleThemeSelect = useCallback((newTheme: "light" | "dark" | "system") => {
     setTheme(newTheme);

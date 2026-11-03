@@ -497,7 +497,9 @@ export async function proxy(request: NextRequest) {
       console.error('Locale middleware error:', error);
     }
   }
-  const response = intlResponse ?? NextResponse.next();
+  const response = signedOutMarker && loginLocale
+    ? redirectTo(request, `/${loginLocale}/login`, "?logged_out=1")
+    : intlResponse ?? NextResponse.next();
 
   // Expose the nonce AND the request pathname to server components as request
   // headers. The root (main)/layout renders <html> ABOVE the [locale] segment,
