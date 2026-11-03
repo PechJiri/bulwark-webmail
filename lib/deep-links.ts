@@ -131,15 +131,28 @@ const VIRTUAL_ALIAS_BY_ID: Record<string, string> = Object.fromEntries(
 /** Mailbox roles that get a readable alias instead of their opaque JMAP id. */
 const ALIASED_ROLES = new Set(['inbox', 'sent', 'drafts', 'trash', 'archive', 'junk']);
 
+/**
+ * `accountId` is the local account (AccountEntry.id). `slot` names the
+ * login by its cookie slot instead - what a push notification knows.
+ */
 export type MailDeepLink =
-  | { kind: 'folder'; ref: string; accountId?: string }
-  | { kind: 'message'; id: string; accountId?: string; fullscreen?: boolean }
-  | { kind: 'thread'; id: string; accountId?: string };
+  | { kind: 'folder'; ref: string; accountId?: string; slot?: number; ownerAccountId?: string }
+  | { kind: 'message'; id: string; accountId?: string; slot?: number; fullscreen?: boolean; ownerAccountId?: string }
+  | { kind: 'thread'; id: string; accountId?: string; slot?: number; ownerAccountId?: string };
 
 export interface MailLinkState {
   mailboxId: string | null;
   emailId: string | null;
   threadId: string | null;
+  /**
+   * The JMAP account a linked message or conversation lives in, when it is not
+   * the login's own: email ids repeat across accounts (#1351).
+   */
+  ownerAccountId?: string | null;
+  /** The login (AccountEntry.id) reaching it, when not the active one. */
+  loginId?: string | null;
+  /** Open a message link alone, without sidebar and list. */
+  fullscreen?: boolean;
 }
 
 /**
@@ -166,8 +179,17 @@ export function buildFolderRef(mailboxId: string, mailboxes: Mailbox[] = []): st
  * Exact ids are checked before aliases so a custom folder whose id happens to
  * read like an alias still resolves to itself.
  */
-export function resolveFolderRef(ref: string, mailboxes: Mailbox[] = []): string | null {
+export function resolveFolderRef(ref: string, mailboxes: Mailbox[] = [], ownerAccountId?: string): string | null {
   const decoded = decodeSegment(ref);
+
+  if (ownerAccountId) {
+    const owned = mailboxes.filter((mailbox) => mailbox.accountId === ownerAccountId);
+    const exact = owned.find((mailbox) => mailbox.id === decoded);
+    if (exact) return exact.id;
+    return ALIASED_ROLES.has(decoded)
+      ? owned.find((mailbox) => mailbox.role === decoded)?.id ?? null
+      : null;
+  }
 
   if (mailboxes.some((m) => m.id === decoded)) return decoded;
 
@@ -186,6 +208,35 @@ export function resolveFolderRef(ref: string, mailboxes: Mailbox[] = []): string
   return decoded || null;
 }
 
+/** The parts of the mail list's state that decide what a folder link shows. */
+export interface OpenFolderView {
+  selectedMailbox: string;
+  isUnifiedView: boolean;
+  isScheduledView: boolean;
+  selectedKeyword: string | null;
+  hasSearch: boolean;
+}
+
+/**
+ * Whether a folder link names the plain folder the list already shows.
+ *
+ * The address bar carries the open folder (`buildMailPath`), so reloading the
+ * page hands that folder back as a link once the boot fetch has loaded it.
+ * Selecting it again would only fetch the same list a second time under the
+ * loading overlay. Virtual views are never "already open" at boot: the boot
+ * fetch does not load them.
+ */
+export function isFolderLinkOpen(mailboxId: string, view: OpenFolderView): boolean {
+  if (VIRTUAL_ALIAS_BY_ID[mailboxId]) return false;
+  return (
+    mailboxId === view.selectedMailbox &&
+    !view.isUnifiedView &&
+    !view.isScheduledView &&
+    !view.selectedKeyword &&
+    !view.hasSearch
+  );
+}
+
 /**
  * The canonical path for the current mail view. Returns `/mail` for the bare
  * list so the address bar stays clean when nothing is open.
@@ -194,10 +245,27 @@ export function resolveFolderRef(ref: string, mailboxes: Mailbox[] = []): string
  * thread is what the user is looking at.
  */
 export function buildMailPath(state: MailLinkState, mailboxes: Mailbox[] = []): string {
-  if (state.threadId) return `/mail/thread/${encodeSegment(state.threadId)}`;
-  if (state.emailId) return `/mail/message/${encodeSegment(state.emailId)}`;
+  const query = (fullscreen: boolean) => {
+    const params = new URLSearchParams();
+    if (state.loginId) params.set('account', state.loginId);
+    if (state.ownerAccountId) params.set('owner', state.ownerAccountId);
+    if (fullscreen) params.set('view', 'fullscreen');
+    const qs = params.toString();
+    return qs ? `?${qs}` : '';
+  };
+  if (state.threadId) return `/mail/thread/${encodeSegment(state.threadId)}${query(false)}`;
+  if (state.emailId) return `/mail/message/${encodeSegment(state.emailId)}${query(!!state.fullscreen)}`;
   if (state.mailboxId) return `/mail/folder/${encodeSegment(buildFolderRef(state.mailboxId, mailboxes))}`;
   return '/mail';
+}
+
+/**
+ * Whether a real browser path (any mount or locale prefix) opens a folder
+ * link, `/mail/folder/<ref>`. Read before the shell renders, when only the
+ * address bar can tell a reload of a folder from a plain visit to the app.
+ */
+export function pathNamesMailFolder(pathname: string): boolean {
+  return /(?:^|\/)mail\/folder\/[^/]+/.test(pathname);
 }
 
 /**
@@ -210,23 +278,27 @@ export function parseMailPath(
   search?: URLSearchParams,
 ): MailDeepLink | null {
   const accountId = search?.get('account') ?? undefined;
+  const rawSlot = search?.get('slot');
+  const slotNumber = rawSlot != null && rawSlot !== '' ? Number(rawSlot) : NaN;
+  const slot = Number.isInteger(slotNumber) && slotNumber >= 0 ? slotNumber : undefined;
   // `?view=fullscreen` asks for the message alone, no sidebar or list - what
   // a mail dragged out into a new browser tab opens as. The Pro shell always
   // opens message links as fullscreen email tabs and ignores the flag.
   const fullscreen = search?.get('view') === 'fullscreen' || undefined;
+  const ownerAccountId = search?.get('owner') || undefined;
   const [kind, value] = segments;
 
   if (kind && value) {
     const id = decodeSegment(value);
     if (id) {
-      if (kind === 'message') return { kind: 'message', id, accountId, fullscreen };
-      if (kind === 'thread') return { kind: 'thread', id, accountId };
-      if (kind === 'folder') return { kind: 'folder', ref: id, accountId };
+      if (kind === 'message') return { kind: 'message', id, accountId, slot, fullscreen, ownerAccountId };
+      if (kind === 'thread') return { kind: 'thread', id, accountId, slot, ownerAccountId };
+      if (kind === 'folder') return { kind: 'folder', ref: id, accountId, slot, ownerAccountId };
     }
   }
 
   const legacyEmail = search?.get('email');
-  if (legacyEmail) return { kind: 'message', id: legacyEmail, accountId };
+  if (legacyEmail) return { kind: 'message', id: legacyEmail, accountId, slot };
 
   return null;
 }
@@ -238,7 +310,7 @@ export function parseMailPath(
 const CALENDAR_VIEWS: CalendarViewMode[] = ['month', 'week', 'day', 'agenda', 'tasks'];
 
 export type CalendarDeepLink =
-  | { kind: 'event'; id: string; accountId?: string }
+  | { kind: 'event'; id: string; accountId?: string; login?: string }
   | { kind: 'view'; view: CalendarViewMode; date: Date | null };
 
 export interface CalendarLinkState {
@@ -247,6 +319,8 @@ export interface CalendarLinkState {
   eventId?: string | null;
   /** JMAP account owning the event - needed for shared/secondary calendars. */
   accountId?: string | null;
+  /** Connected-account id (login) reaching the event, when not the active one (global search). */
+  login?: string | null;
 }
 
 /** `YYYY-MM-DD` in local time - the date the user sees, not a UTC shift of it. */
@@ -272,7 +346,11 @@ export function parseLinkDate(value: string): Date | null {
 export function buildCalendarPath(state: CalendarLinkState): string {
   if (state.eventId) {
     const path = `/calendar/event/${encodeSegment(state.eventId)}`;
-    return state.accountId ? `${path}?account=${encodeURIComponent(state.accountId)}` : path;
+    const params = new URLSearchParams();
+    if (state.accountId) params.set('account', state.accountId);
+    if (state.login) params.set('login', state.login);
+    const query = params.toString();
+    return query ? `${path}?${query}` : path;
   }
   if (!state.date) return `/calendar/${state.view}`;
   return `/calendar/${state.view}/${formatLinkDate(state.date)}`;
@@ -288,7 +366,7 @@ export function parseCalendarPath(
   if (first === 'event') {
     const id = second ? decodeSegment(second) : '';
     if (!id) return null;
-    return { kind: 'event', id, accountId: search?.get('account') ?? undefined };
+    return { kind: 'event', id, accountId: search?.get('account') ?? undefined, login: search?.get('login') ?? undefined };
   }
 
   if ((CALENDAR_VIEWS as string[]).includes(first)) {
@@ -374,6 +452,12 @@ export interface FilesDeepLink {
   path: string;
   /** File name to preview once the folder has loaded, if the link named one. */
   preview?: string;
+  /**
+   * A node of a drive shared with the user, or a page of such a drive, by the
+   * id the Files store lists it under ("<owner>:<id>"). It has no path under
+   * the user's own root; the Files app opens where it is listed instead.
+   */
+  shared?: string;
 }
 
 export function buildFilesPath(currentPath: string, preview?: string | null): string {
@@ -382,31 +466,52 @@ export function buildFilesPath(currentPath: string, preview?: string | null): st
   return preview ? `${base}?preview=${encodeURIComponent(preview)}` : base;
 }
 
+/** The query of a link into a shared drive (see FilesDeepLink.shared), leading `?` included. */
+export function sharedFilesSearch(id: string, preview?: string | null): string {
+  const query = `?shared=${encodeURIComponent(id)}`;
+  return preview ? `${query}&preview=${encodeURIComponent(preview)}` : query;
+}
+
+export function buildSharedFilesPath(id: string, preview?: string | null): string {
+  return `/files${sharedFilesSearch(id, preview)}`;
+}
+
 export function parseFilesPath(
   segments: string[] = [],
   search?: URLSearchParams,
 ): FilesDeepLink | null {
   const parts = segments.map(decodeSegment).filter(Boolean);
   const preview = search?.get('preview') ?? undefined;
-  if (parts.length === 0 && !preview) return null;
-  return { path: `/${parts.join('/')}`, preview };
+  const shared = search?.get('shared') || undefined;
+  if (parts.length === 0 && !preview && !shared) return null;
+  return { path: `/${parts.join('/')}`, preview, ...(shared ? { shared } : {}) };
 }
 
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
-export function buildSettingsPath(tabId: string | null | undefined): string {
-  return tabId ? `/settings/${encodeSegment(tabId)}` : '/settings';
+/** `/settings/<tab>`, or `/settings/<tab>/<section>` to land on one section of the page. */
+export function buildSettingsPath(tabId: string | null | undefined, section?: string | null): string {
+  if (!tabId) return '/settings';
+  const base = `/settings/${encodeSegment(tabId)}`;
+  return section ? `${base}/${encodeSegment(section)}` : base;
 }
 
 /**
- * The tab id from `/settings/<tab>`. Validation against the real tab registry
- * is the settings page's job - it owns the list and the legacy-id migration.
+ * The tab id from `/settings/<tab>[/<section>]`. Validation against the real
+ * tab registry is the settings page's job - it owns the list and the
+ * legacy-id migration.
  */
 export function parseSettingsPath(segments: string[] = []): string | null {
   const [tab] = segments;
   return tab ? decodeSegment(tab) : null;
+}
+
+/** The section id from `/settings/<tab>/<section>`, if the link names one. */
+export function parseSettingsSection(segments: string[] = []): string | null {
+  const [, section] = segments;
+  return section ? decodeSegment(section) : null;
 }
 
 // ---------------------------------------------------------------------------

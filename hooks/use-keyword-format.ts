@@ -8,6 +8,9 @@ import {
   type KeywordColor,
 } from "@/stores/settings-store";
 import { formatKeyword, formatKeywordLabels, keywordRenderings } from "@/lib/keyword-format";
+import { suggestKeywordColor } from "@/lib/keyword-discovery";
+import { useAccountTags, type TagScope } from "@/hooks/use-account-tags";
+import { CVD_CLASSES, cvdHue } from "@/lib/cvd-palette";
 
 /**
  * Names and colours tags for the screen, bound to the user's tag settings.
@@ -17,10 +20,15 @@ import { formatKeyword, formatKeywordLabels, keywordRenderings } from "@/lib/key
  * someone who never asked for nesting. Subscribing to them also keeps tags in
  * step the moment either changes: reading the store inside the formatter would
  * leave every list stale until something else happened to re-render it.
+ *
+ * The definitions are those of the account in `scope` (useAccountTags): a
+ * group account's shared tags, otherwise the user's own. Without `scope`
+ * the TagScopeContext around the caller decides.
  */
-export function useKeywordFormat() {
-  const keywords = useSettingsStore((state) => state.emailKeywords);
+export function useKeywordFormat(scope?: TagScope | null) {
+  const keywords = useAccountTags(scope).definitions;
   const nested = useSettingsStore((state) => state.nestedTags);
+  const colorBlindPalette = useSettingsStore((state) => state.colorBlindPalette);
 
   return useMemo(
     () => ({
@@ -31,13 +39,28 @@ export function useKeywordFormat() {
       tagNameCandidates: (id: string) => keywordRenderings(formatKeywordLabels(id, keywords, nested)),
 
       /**
-       * The tag's colour. Falls back to grey for a keyword this client has no
-       * definition for - one created on another device, or whose tag was
-       * deleted - so such a tag still shows rather than silently vanishing.
+       * The tag's colour.
+       *
+       * A keyword this client has no definition for - one created on another
+       * device, applied by a server-side filter, or whose tag was deleted -
+       * still gets a hue of its own, derived from its id by the same function
+       * that proposes colours for recovered tags. One shared grey made every
+       * such tag look alike, which is exactly when telling them apart matters:
+       * a mailbox filling up with server-assigned tags would show a single
+       * undifferentiated colour. The hue is a pure function of the id, so it is
+       * stable across reloads and devices, and it degrades to grey only when
+       * the proposal names a colour the palette does not hold.
        */
       tagColor: (id: string): KeywordColor => {
-        const color = keywords.find((keyword) => keyword.id === id)?.color;
-        return (color ? KEYWORD_PALETTE[color] : undefined) ?? KEYWORD_PALETTE[FALLBACK_KEYWORD_COLOR];
+        const stored = keywords.find((keyword) => keyword.id === id)?.color;
+        const suggested = suggestKeywordColor(id);
+        const color = stored && KEYWORD_PALETTE[stored]
+          ? stored
+          : KEYWORD_PALETTE[suggested] ? suggested : FALLBACK_KEYWORD_COLOR;
+        // Colour-blind-safe colours: the same tag, drawn in the palette
+        // colour nearest its own (lib/cvd-palette.ts). The stored colour stays.
+        if (colorBlindPalette) return CVD_CLASSES[cvdHue(color) ?? "grey"];
+        return KEYWORD_PALETTE[color];
       },
 
       /**
@@ -59,6 +82,6 @@ export function useKeywordFormat() {
         );
       },
     }),
-    [keywords, nested],
+    [keywords, nested, colorBlindPalette],
   );
 }

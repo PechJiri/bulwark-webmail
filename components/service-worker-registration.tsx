@@ -1,12 +1,18 @@
 "use client";
 
 import { useEffect } from "react";
-
-const BASE_PATH = (process.env.NEXT_PUBLIC_BASE_PATH ?? "").replace(/\/+$/, "");
+import { IS_LITE } from "@/lib/lite";
+import { adoptWaitingWorker, announceBuildToServiceWorker, serviceWorkerUrl, SW_SCOPE } from "@/lib/app-update";
 
 export function ServiceWorkerRegistration() {
   useEffect(() => {
     if (typeof window === "undefined" || !("serviceWorker" in navigator)) {
+      return;
+    }
+    // sw.js enriches push notifications through /api/push/preview and serves
+    // icons from /api/pwa-icon; neither exists in the static build. Push stays
+    // off in Lite v1, so the worker is not registered at all.
+    if (IS_LITE) {
       return;
     }
 
@@ -24,14 +30,22 @@ export function ServiceWorkerRegistration() {
       return;
     }
 
+    // With this build's id in the URL, a deploy installs a new worker, which
+    // keeps its caches apart from the old build's (public/sw.js).
     navigator.serviceWorker
-      .register(`${BASE_PATH}/sw.js`, { scope: `${BASE_PATH}/` })
+      .register(serviceWorkerUrl(), { scope: SW_SCOPE })
       .then((registration) => {
         console.log("Service Worker registered successfully:", registration);
+        announceBuildToServiceWorker();
+        adoptWaitingWorker(registration);
       })
       .catch((error) => {
         console.error("Service Worker registration failed:", error);
       });
+    // A worker that takes over later (after a deploy) learns this tab's build too.
+    const onControllerChange = () => announceBuildToServiceWorker();
+    navigator.serviceWorker.addEventListener("controllerchange", onControllerChange);
+    return () => navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
   }, []);
 
   return null;

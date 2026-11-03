@@ -9,9 +9,14 @@ vi.mock('@/lib/stalwart/jmap-passthrough', () => ({
   },
 }));
 
+const updateBasicPassword = vi.fn(async (_password: string) => {});
+const auth = vi.hoisted(() => ({ isDemoMode: false }));
+
 vi.mock('@/stores/auth-store', () => ({
   useAuthStore: {
     getState: () => ({
+      updateBasicPassword,
+      isDemoMode: auth.isDemoMode,
       client: {
         getAccountId: () => 'acc-primary',
         hasAccountCapability: (cap: string) => cap === 'urn:stalwart:jmap',
@@ -33,6 +38,7 @@ describe('account-security-store', () => {
   beforeEach(() => {
     mockedJmap.mockReset();
     resetStore();
+    auth.isDemoMode = false;
   });
 
   describe('probe', () => {
@@ -152,12 +158,31 @@ describe('account-security-store', () => {
   });
 
   describe('fetchPrincipal', () => {
+    // Demo Contacts and Calendar logged "Failed to fetch principal: Not
+    // authenticated": the demo has no server session for the passthrough.
+    it('does not ask the server in demo mode, and stays quiet', async () => {
+      auth.isDemoMode = true;
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      let errorLogs = 0;
+      try {
+        await useAccountSecurityStore.getState().fetchPrincipal();
+        errorLogs = consoleError.mock.calls.length;
+      } finally {
+        consoleError.mockRestore();
+      }
+      expect(mockedJmap).not.toHaveBeenCalled();
+      expect(useAccountSecurityStore.getState().error).toBeNull();
+      expect(useAccountSecurityStore.getState().isLoadingPrincipal).toBe(false);
+      expect(errorLogs).toBe(0);
+    });
+
     it('combines primary name with enabled aliases and exposes quota/roles', async () => {
       mockedJmap.mockResolvedValueOnce([
+        ['x:AccountSettings/get', { list: [{ id: 'singleton', description: 'Display User' }] }, 's'],
         ['x:Account/get', {
           list: [{
             name: 'user@example.com',
-            description: 'Display User',
+            description: 'Stale Admin Copy',
             aliases: {
               a1: { name: 'alias1@example.com', enabled: true },
               a2: { name: 'alias2@example.com', enabled: false },
@@ -178,6 +203,24 @@ describe('account-security-store', () => {
       expect(state.roles).toEqual(['User']);
     });
 
+    it('reads the name from AccountSettings when x:Account/get is forbidden for this user', async () => {
+      mockedJmap.mockResolvedValueOnce([
+        ['x:AccountSettings/get', { list: [{ id: 'singleton', description: 'Plain User' }] }, 's'],
+        ['error', { type: 'forbidden', description: 'You are not authorized to perform this action' }, '0'],
+      ]);
+
+      await useAccountSecurityStore.getState().fetchPrincipal();
+
+      const state = useAccountSecurityStore.getState();
+      expect(state.displayName).toBe('Plain User');
+      expect(state.emails).toEqual([]);
+      expect(state.error).toBeNull();
+      expect(state.isLoadingPrincipal).toBe(false);
+      expect(mockedJmap.mock.calls[0][0][0]).toEqual(
+        ['x:AccountSettings/get', { accountId: 'acc-primary', ids: ['singleton'] }, 's'],
+      );
+    });
+
     it('swallows forbidden errors (non-admins cannot read their own Account) without setting error', async () => {
       mockedJmap.mockRejectedValueOnce(new Error('Forbidden: missing sysAccountGet permission'));
 
@@ -187,12 +230,42 @@ describe('account-security-store', () => {
       expect(useAccountSecurityStore.getState().error).toBeNull();
     });
 
+    it('recognises the forbidden method error Stalwart actually sends and stays quiet', async () => {
+      // The passthrough surfaces a JMAP method error as Error(description)
+      // with the type alongside - the description never says "forbidden".
+      const refused = Object.assign(new Error('You are not authorized to perform this action'), {
+        status: 200,
+        methodError: { type: 'forbidden', description: 'You are not authorized to perform this action' },
+      });
+      mockedJmap.mockRejectedValueOnce(refused);
+      // mockRestore also clears the recorded calls, so count before restoring.
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      let errorLogs = 0;
+      try {
+        await useAccountSecurityStore.getState().fetchPrincipal();
+        errorLogs = consoleError.mock.calls.length;
+      } finally {
+        consoleError.mockRestore();
+      }
+
+      expect(useAccountSecurityStore.getState().isLoadingPrincipal).toBe(false);
+      expect(useAccountSecurityStore.getState().error).toBeNull();
+      expect(errorLogs).toBe(0);
+    });
+
     it('records non-forbidden errors', async () => {
       mockedJmap.mockRejectedValueOnce(new Error('network down'));
-
-      await useAccountSecurityStore.getState().fetchPrincipal();
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+      let errorLogs = 0;
+      try {
+        await useAccountSecurityStore.getState().fetchPrincipal();
+        errorLogs = consoleError.mock.calls.length;
+      } finally {
+        consoleError.mockRestore();
+      }
 
       expect(useAccountSecurityStore.getState().error).toBe('network down');
+      expect(errorLogs).toBe(1);
     });
   });
 
@@ -213,6 +286,18 @@ describe('account-security-store', () => {
         },
         '0',
       ]]);
+    });
+
+    it('sends the current TOTP code as otpAuth/otpCode so TOTP stays on', async () => {
+      mockedJmap.mockResolvedValueOnce([
+        ['x:AccountPassword/set', { updated: { singleton: null } }, '0'],
+      ]);
+
+      await useAccountSecurityStore.getState().changePassword('old', 'new', ' 123456 ');
+      expect(updateBasicPassword).toHaveBeenCalledWith('new');
+
+      const args = mockedJmap.mock.calls[0][0][0][1];
+      expect(args.update.singleton).toEqual({ currentSecret: 'old', secret: 'new', 'otpAuth/otpCode': '123456' });
     });
 
     it('propagates errors and records state', async () => {
@@ -250,6 +335,16 @@ describe('account-security-store', () => {
       const args = mockedJmap.mock.calls[0][0][0][1];
       expect(args).toEqual({ accountId: 'acc-primary', update: { singleton: { description: 'New Name' } } });
     });
+
+    it('throws when the server refuses the update', async () => {
+      useAccountSecurityStore.setState({ displayName: 'Old' });
+      mockedJmap.mockResolvedValueOnce([
+        ['x:AccountSettings/set', { notUpdated: { singleton: { type: 'forbidden', description: 'Operation not allowed.' } } }, '0'],
+      ]);
+
+      await expect(useAccountSecurityStore.getState().updateDisplayName('New')).rejects.toThrow('Operation not allowed.');
+      expect(useAccountSecurityStore.getState().displayName).toBe('Old');
+    });
   });
 
   describe('enableTotp / disableTotp', () => {
@@ -279,6 +374,17 @@ describe('account-security-store', () => {
       expect(useAccountSecurityStore.getState().otpEnabled).toBe(false);
       const args = mockedJmap.mock.calls[0][0][0][1];
       expect(args.update.singleton).toEqual({ currentSecret: 'pw', otpAuth: { otpUrl: null } });
+    });
+
+    it('disableTotp sends the current code', async () => {
+      mockedJmap.mockResolvedValueOnce([
+        ['x:AccountPassword/set', { updated: { singleton: null } }, '0'],
+      ]);
+
+      await useAccountSecurityStore.getState().disableTotp('pw', '654321');
+
+      const args = mockedJmap.mock.calls[0][0][0][1];
+      expect(args.update.singleton).toEqual({ currentSecret: 'pw', otpAuth: { otpUrl: null, otpCode: '654321' } });
     });
   });
 

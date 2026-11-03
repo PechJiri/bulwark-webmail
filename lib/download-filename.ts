@@ -20,13 +20,6 @@ export interface EmailFilenameOptions extends FilenameTransformOptions {
   template?: string;
 }
 
-export const DEFAULT_TRANSFORM: Required<FilenameTransformOptions> = {
-  spaceReplacement: "keep",
-  lowercase: false,
-  stripDiacritics: false,
-  collapseSeparators: true,
-};
-
 export const DEFAULT_EMAIL_TEMPLATE = "{date} ({from}-{to}) {subject}";
 export const DEFAULT_ATTACHMENT_TEMPLATE = "{filename}";
 export const DEFAULT_BUNDLE_TEMPLATE = "emails-{count}";
@@ -225,6 +218,26 @@ export function attachmentDownloadFilename(
   if (!ext) return transformedStem;
   const transformedExt = opts.lowercase ? ext.toLocaleLowerCase() : ext;
   return `${transformedStem}.${transformedExt}`;
+}
+
+// Pick a name for `stem` + `ext` that is not already in `used`. First choice
+// is the bare name, then `stem [tag]ext`, then a running counter. Every step
+// produces a new candidate, so this always terminates - the previous inline
+// loop in the drag-out bundler re-tried the same `[tag]` name forever when two
+// entries shared a stem and a tag (Stalwart email ids in one thread share the
+// same prefix, and bulk-imported mail shares the same receivedAt second).
+// Does not add the result to `used`; the caller decides when to claim it.
+export function uniqueFilename(used: Set<string>, stem: string, ext: string, tag?: string): string {
+  let name = `${stem}${ext}`;
+  if (!used.has(name)) return name;
+  if (tag) {
+    name = `${stem} [${tag}]${ext}`;
+    if (!used.has(name)) return name;
+  }
+  for (let i = 2; ; i++) {
+    name = tag ? `${stem} [${tag}] (${i})${ext}` : `${stem} (${i})${ext}`;
+    if (!used.has(name)) return name;
+  }
 }
 
 // Name for a .zip bundling every attachment of a single email, e.g.

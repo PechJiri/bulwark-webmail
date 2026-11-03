@@ -1,7 +1,7 @@
 'use client';
 
 import { useTranslations } from 'next-intl';
-import { Mail, Tag } from 'lucide-react';
+import { Mail, Tag } from '@/components/icons';
 import { cn } from '@/lib/utils';
 import type { Email, Identity } from '@/lib/jmap/types';
 import { parseSubAddress } from '@/lib/sub-addressing';
@@ -64,6 +64,13 @@ export function EmailIdentityBadge({
   // Determine which tag to display (sent or received)
   const displayTag = matchingIdentity ? parsedFrom.tag : receivedToTag;
 
+  // "via <identity>" only tells the user something when the identity's name
+  // differs from the name already shown as the sender ("User A via User A").
+  const showIdentityName = !!matchingIdentity?.name
+    && matchingIdentity.name !== matchingIdentity.email
+    && matchingIdentity.name !== fromAddress
+    && matchingIdentity.name !== email.from?.[0]?.name;
+
   // Don't show badge if not from user's identity and not to user's sub-address
   if (!matchingIdentity && !receivedToTag) return null;
 
@@ -85,12 +92,7 @@ export function EmailIdentityBadge({
       );
     }
 
-    if (
-      matchingIdentity &&
-      matchingIdentity.name &&
-      matchingIdentity.name !== matchingIdentity.email &&
-      matchingIdentity.name !== fromAddress
-    ) {
+    if (matchingIdentity && showIdentityName) {
       return (
         <div
           className={cn(
@@ -129,11 +131,7 @@ export function EmailIdentityBadge({
       )}
 
       {/* Identity badge (only if identity has a name and no sub-address tag) */}
-      {!displayTag &&
-        matchingIdentity &&
-        matchingIdentity.name &&
-        matchingIdentity.name !== matchingIdentity.email &&
-        matchingIdentity.name !== fromAddress && (
+      {!displayTag && matchingIdentity && showIdentityName && (
           <div
             className={cn(
               'inline-flex items-center gap-1 px-2 py-0.5 rounded-md',

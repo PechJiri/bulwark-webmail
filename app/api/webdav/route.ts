@@ -1,6 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { rejectCrossOriginRequest } from '@/lib/security/same-origin';
 import { logger } from '@/lib/logger';
 import { getStalwartCredentials } from '@/lib/stalwart/credentials';
+import { forwardedClientHeaders, loginClientAddress } from '@/lib/auth/client-address';
+import { fetchJmapServer } from '@/lib/stalwart/server-fetch';
+import { DisallowedUrlError } from '@/lib/security/url-guard';
+import { UpstreamBodyTooLargeError, readBodyCapped, readTextCapped } from '@/lib/security/capped-body';
+import { bootGateResponse } from '@/lib/shared-store/boot-gate';
+
+/** A PROPFIND listing of a folder with many thousand entries still fits. */
+const MAX_PROPFIND_RESPONSE_BYTES = 50 * 1024 * 1024;
+/** PROPFIND and MKCALENDAR bodies are a few lines of XML; proxy.ts doesn't run here to cap them. */
+const MAX_XML_REQUEST_BYTES = 1024 * 1024;
 
 const ALLOWED_METHODS = new Set(['PROPFIND', 'MKCOL', 'MKCALENDAR', 'GET', 'PUT', 'DELETE', 'MOVE', 'COPY']);
 
@@ -49,6 +60,13 @@ function buildDavTargetUrl(baseUrl: string, username: string, rawPath: string, c
  *   Overwrite: WebDAV Overwrite header for MOVE/COPY
  */
 export async function POST(request: NextRequest) {
+  // The proxy doesn't run for this route, so it applies the boot gate itself.
+  const notReady = bootGateResponse();
+  if (notReady) return notReady;
+  // CSRF gate (GHSA-9mvj-98f5-9q6g): this handler acts with the caller's
+  // session cookie, which SameSite=Lax still sends from a same-site page.
+  const crossOrigin = rejectCrossOriginRequest(request);
+  if (crossOrigin) return crossOrigin;
   try {
     const creds = await getStalwartCredentials(request);
     if (!creds) {
@@ -72,6 +90,7 @@ export async function POST(request: NextRequest) {
     // Build headers for the upstream request
     const upstreamHeaders: Record<string, string> = {
       'Authorization': creds.authHeader,
+      ...forwardedClientHeaders(loginClientAddress(request)),
     };
 
     // Forward relevant WebDAV headers
@@ -95,19 +114,22 @@ export async function POST(request: NextRequest) {
     // PROPFIND and MKCALENDAR bodies are small XML and are read fully.
     let body: ArrayBuffer | ReadableStream<Uint8Array> | null = null;
     if (method === 'PROPFIND' || method === 'MKCALENDAR') {
-      body = await request.arrayBuffer();
+      body = await readBodyCapped(request, MAX_XML_REQUEST_BYTES);
+      if (!body) return NextResponse.json({ error: 'Request body too large' }, { status: 413 });
     } else if (method === 'PUT') {
       body = request.body;
     }
 
-    const response = await fetch(targetUrl, {
+    // A user-chosen server (allowCustomJmapEndpoint) goes through the
+    // rebinding-safe fetch; see lib/stalwart/server-fetch.ts.
+    const response = await fetchJmapServer(targetUrl, {
       method,
       headers: upstreamHeaders,
       body,
       redirect: 'follow',
       // `duplex: 'half'` is required by undici when sending a streaming request body.
       ...(method === 'PUT' ? { duplex: 'half' } : {}),
-    } as Parameters<typeof fetch>[1] & { duplex?: 'half' });
+    }, creds.trusted);
 
     // For file downloads (GET), stream the response back
     if (method === 'GET') {
@@ -125,7 +147,7 @@ export async function POST(request: NextRequest) {
 
     // For PROPFIND, return XML with the actual request URI for href comparison
     if (method === 'PROPFIND') {
-      const text = await response.text();
+      const text = await readTextCapped(response, MAX_PROPFIND_RESPONSE_BYTES);
       const headers = new Headers();
       headers.set('Content-Type', 'application/xml; charset=utf-8');
       headers.set('X-WebDAV-Request-URI', targetUrl);
@@ -143,6 +165,14 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('Invalid WebDAV path')) {
       return NextResponse.json({ error: error.message }, { status: 400 });
+    }
+    if (error instanceof DisallowedUrlError) {
+      logger.warn('WebDAV proxy refused non-public server address', { error: error.message });
+      return NextResponse.json({ error: 'JMAP server address is not allowed' }, { status: 502 });
+    }
+    if (error instanceof UpstreamBodyTooLargeError) {
+      logger.warn('WebDAV proxy response too large', { maxBytes: error.maxBytes });
+      return NextResponse.json({ error: 'WebDAV response is too large' }, { status: 502 });
     }
 
     logger.error('WebDAV proxy error', { error: error instanceof Error ? error.message : 'Unknown' });

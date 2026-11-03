@@ -1,100 +1,19 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useTranslations } from "next-intl";
 import { Button } from "@/components/ui/button";
 import { Avatar } from "@/components/ui/avatar";
-import { X, Loader2, UserPlus, Trash2, Users, ChevronDown } from "lucide-react";
+import { Loader2, UserPlus, Trash2, ChevronDown, Share2 } from "@/components/icons";
+import { Dialog } from "@/components/ui/dialog";
 import type { IJMAPClient } from "@/lib/jmap/client-interface";
-import type { Principal, CalendarRights, AddressBookRights, FileNodeRights } from "@/lib/jmap/types";
+import type { Principal, PrincipalDirectoryStatus } from "@/lib/jmap/types";
+import { detectPreset, presetRights, type AnyRights, type RolePreset, type ShareKind } from "@/lib/jmap/share-rights";
+import { loadPrincipalDirectory } from "@/lib/jmap/principal-directory";
 import { toast } from "@/stores/toast-store";
-
-type ShareKind = "calendar" | "addressBook" | "file";
-type AnyRights = CalendarRights | AddressBookRights | FileNodeRights;
-
-type RolePreset = "freeBusy" | "read" | "readWrite" | "manager" | "custom";
-
-const CALENDAR_PRESETS: Record<Exclude<RolePreset, "custom">, CalendarRights> = {
-  freeBusy: {
-    mayReadFreeBusy: true, mayReadItems: false, mayWriteAll: false, mayWriteOwn: false,
-    mayUpdatePrivate: false, mayRSVP: false, mayShare: false, mayDelete: false,
-  },
-  read: {
-    mayReadFreeBusy: true, mayReadItems: true, mayWriteAll: false, mayWriteOwn: false,
-    mayUpdatePrivate: false, mayRSVP: false, mayShare: false, mayDelete: false,
-  },
-  readWrite: {
-    mayReadFreeBusy: true, mayReadItems: true, mayWriteAll: true, mayWriteOwn: true,
-    mayUpdatePrivate: true, mayRSVP: true, mayShare: false, mayDelete: false,
-  },
-  manager: {
-    mayReadFreeBusy: true, mayReadItems: true, mayWriteAll: true, mayWriteOwn: true,
-    mayUpdatePrivate: true, mayRSVP: true, mayShare: true, mayDelete: true,
-  },
-};
-
-const ADDRESS_BOOK_PRESETS: Record<Exclude<RolePreset, "custom" | "freeBusy">, AddressBookRights> = {
-  read: { mayRead: true, mayWrite: false, mayShare: false, mayDelete: false },
-  readWrite: { mayRead: true, mayWrite: true, mayShare: false, mayDelete: false },
-  manager: { mayRead: true, mayWrite: true, mayShare: true, mayDelete: true },
-};
-
-const FILE_PRESETS: Record<Exclude<RolePreset, "custom" | "freeBusy">, FileNodeRights> = {
-  read: {
-    mayRead: true, mayAddChildren: false, mayRename: false,
-    mayDelete: false, mayModifyContent: false, mayShare: false,
-  },
-  readWrite: {
-    mayRead: true, mayAddChildren: true, mayRename: true,
-    mayDelete: true, mayModifyContent: true, mayShare: false,
-  },
-  manager: {
-    mayRead: true, mayAddChildren: true, mayRename: true,
-    mayDelete: true, mayModifyContent: true, mayShare: true,
-  },
-};
-
-function detectCalendarPreset(r: CalendarRights): RolePreset {
-  for (const [name, preset] of Object.entries(CALENDAR_PRESETS) as [Exclude<RolePreset, "custom">, CalendarRights][]) {
-    if ((Object.keys(preset) as (keyof CalendarRights)[]).every((k) => preset[k] === r[k])) {
-      return name;
-    }
-  }
-  return "custom";
-}
-
-function detectAddressBookPreset(r: AddressBookRights): RolePreset {
-  for (const [name, preset] of Object.entries(ADDRESS_BOOK_PRESETS) as [Exclude<RolePreset, "custom" | "freeBusy">, AddressBookRights][]) {
-    const keys = Object.keys(preset) as (keyof AddressBookRights)[];
-    if (keys.every((k) => preset[k] === (r[k] ?? false))) {
-      return name;
-    }
-  }
-  return "custom";
-}
-
-function detectFilePreset(r: FileNodeRights): RolePreset {
-  for (const [name, preset] of Object.entries(FILE_PRESETS) as [Exclude<RolePreset, "custom" | "freeBusy">, FileNodeRights][]) {
-    const keys = Object.keys(preset) as (keyof FileNodeRights)[];
-    if (keys.every((k) => preset[k] === (r[k] ?? false))) {
-      return name;
-    }
-  }
-  return "custom";
-}
-
-function presetRights(kind: ShareKind, preset: RolePreset): AnyRights | undefined {
-  if (preset === "custom") return undefined;
-  if (kind === "calendar") return CALENDAR_PRESETS[preset as keyof typeof CALENDAR_PRESETS];
-  if (kind === "file") return FILE_PRESETS[preset as keyof typeof FILE_PRESETS];
-  return ADDRESS_BOOK_PRESETS[preset as keyof typeof ADDRESS_BOOK_PRESETS];
-}
-
-function detectPreset(kind: ShareKind, rights: AnyRights): RolePreset {
-  if (kind === "calendar") return detectCalendarPreset(rights as CalendarRights);
-  if (kind === "file") return detectFilePreset(rights as FileNodeRights);
-  return detectAddressBookPreset(rights as AddressBookRights);
-}
+import { useRestriction } from "@/hooks/use-restriction";
+import { allowedLevels } from "@/lib/delegation/delegation";
+import { OrgLockedNote } from "./org-locked-note";
 
 interface ShareCollectionDialogProps {
   client: IJMAPClient;
@@ -117,23 +36,27 @@ export function ShareCollectionDialog({
 }: ShareCollectionDialogProps) {
   const t = useTranslations("sharing");
   const tCommon = useTranslations("common");
-  const modalRef = useRef<HTMLDivElement>(null);
   const [allPrincipals, setAllPrincipals] = useState<Principal[]>([]);
+  const [directoryStatus, setDirectoryStatus] = useState<PrincipalDirectoryStatus>("ok");
+  const [directoryQueriesOff, setDirectoryQueriesOff] = useState(false);
   const [loadingPrincipals, setLoadingPrincipals] = useState(true);
   const [search, setSearch] = useState("");
   const [savingId, setSavingId] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
+  // The admin's `sharingRights`: without write, only the read presets.
+  const sharingRights = useRestriction("sharingRights");
+  const writeAllowed = allowedLevels(sharingRights.allowedValues).includes("write");
 
   // Load principals on mount
   useEffect(() => {
     let cancelled = false;
     setLoadingPrincipals(true);
-    client.getPrincipals().then((list) => {
+    void loadPrincipalDirectory(client).then(({ principals, status, directoryQueriesOff }) => {
       if (cancelled) return;
-      setAllPrincipals(list);
+      setAllPrincipals(principals);
+      setDirectoryStatus(status);
+      setDirectoryQueriesOff(!!directoryQueriesOff);
       setLoadingPrincipals(false);
-    }).catch(() => {
-      if (!cancelled) setLoadingPrincipals(false);
     });
     return () => { cancelled = true; };
   }, [client]);
@@ -153,17 +76,15 @@ export function ShareCollectionDialog({
     return allPrincipals.filter((p) => p.id !== ownAccountId && !existing.has(p.id));
   }, [allPrincipals, ownAccountId, shareWith]);
 
-  // Close on Escape, focus trap, click outside
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  const presetOptions: RolePreset[] = [
+    ...(kind === "calendar" ? ["freeBusy" as const] : []),
+    "read",
+    ...(writeAllowed ? ["readWrite" as const, "manager" as const] : []),
+  ];
 
   const handleSetRights = async (principalId: string, preset: RolePreset) => {
     if (preset === "custom") return; // custom is read-only here
+    if (!(presetOptions as readonly RolePreset[]).includes(preset)) return;
     const rights = presetRights(kind, preset);
     if (!rights) return;
     setSavingId(principalId);
@@ -219,36 +140,22 @@ export function ShareCollectionDialog({
     return Object.entries(shareWith || {}) as [string, AnyRights][];
   }, [shareWith]);
 
-  const presetOptions = kind === "calendar"
-    ? ["freeBusy", "read", "readWrite", "manager"] as const
-    : ["read", "readWrite", "manager"] as const;
+
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-[1px]" onClick={onClose} aria-hidden="true" />
-      <div
-        ref={modalRef}
-        role="dialog"
-        aria-modal="true"
-        aria-label={t("title", { name: collectionName })}
-        className="relative bg-background border border-border rounded-lg shadow-xl w-full max-w-lg mx-4 animate-in zoom-in-95 duration-200 max-h-[85vh] flex flex-col"
-      >
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border">
-          <div className="flex items-center gap-2">
-            <Users className="w-5 h-5 text-primary" />
-            <h2 className="text-lg font-semibold">{t("title", { name: collectionName })}</h2>
-          </div>
-          <button
-            onClick={onClose}
-            className="p-1.5 rounded-md hover:bg-muted transition-colors duration-150 text-muted-foreground hover:text-foreground"
-            aria-label={tCommon("close")}
-          >
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        <div className="px-6 py-4 space-y-4 overflow-y-auto">
+    // The shared dialog shell (R4): focus moves in and comes back, Escape
+    // and the close X work from anywhere in it.
+    <Dialog
+      isOpen
+      onClose={onClose}
+      title={t("title", { name: collectionName })}
+      icon={<Share2 className="w-5 h-5 text-primary shrink-0 mt-1" />}
+      size="lg"
+      footer={<Button onClick={onClose}>{tCommon("close")}</Button>}
+    >
+        <div className="pt-4 space-y-4">
           <p className="text-sm text-muted-foreground">{t("description")}</p>
+          {!writeAllowed && <OrgLockedNote />}
 
           {sharedEntries.length === 0 && !showAdd && (
             <div className="text-sm text-muted-foreground italic py-4 text-center">
@@ -260,6 +167,9 @@ export function ShareCollectionDialog({
             <ul className="divide-y divide-border rounded-md border border-border overflow-hidden">
               {sharedEntries.map(([principalId, rights]) => {
                 const principal = allPrincipalsById.get(principalId);
+                // Stalwart 1.0 with directory queries off hides every principal
+                // the user has no relationship with, so a sharee may have no name.
+                const unresolved = !principal && !loadingPrincipals;
                 const preset = detectPreset(kind, rights);
                 return (
                   <li key={principalId} className="flex items-center gap-3 px-3 py-2.5">
@@ -271,8 +181,11 @@ export function ShareCollectionDialog({
                     />
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium truncate">
-                        {principal?.name || principal?.email || principalId}
+                        {principal?.name || principal?.email || (unresolved ? t("unknown_user") : principalId)}
                       </div>
+                      {unresolved && (
+                        <div className="text-xs text-muted-foreground truncate">{principalId}</div>
+                      )}
                       {principal?.description && (
                         <div className="text-xs text-muted-foreground truncate">
                           {principal.description}
@@ -281,16 +194,18 @@ export function ShareCollectionDialog({
                     </div>
                     <div className="relative">
                       <select
+                        aria-label={t("access_for", { name: principal?.name || principal?.email || principalId })}
                         value={preset}
                         onChange={(e) => handleSetRights(principalId, e.target.value as RolePreset)}
                         disabled={savingId === principalId}
-                        className="appearance-none rounded-md border border-input bg-background ps-3 pe-8 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
+                        className="appearance-none rounded-md border border-input bg-background ps-3 pe-8 py-1.5 text-xs focus:outline-hidden disabled:opacity-50"
                       >
                         {presetOptions.map((p) => (
                           <option key={p} value={p}>{t(`preset.${p}`)}</option>
                         ))}
-                        {preset === "custom" && (
-                          <option value="custom">{t("preset.custom")}</option>
+                        {/* A grant the admin no longer lets users give stays named, but can't be picked. */}
+                        {!presetOptions.includes(preset) && (
+                          <option value={preset} disabled>{t(`preset.${preset}`)}</option>
                         )}
                       </select>
                       <ChevronDown className="w-3 h-3 absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-muted-foreground" />
@@ -326,13 +241,26 @@ export function ShareCollectionDialog({
           {showAdd && (
             <div className="space-y-2 border border-border rounded-md p-3">
               <input
+                aria-label={t("search_placeholder")}
                 type="text"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder={t("search_placeholder")}
-                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-hidden"
                 autoFocus
               />
+              {/* The list below is partial or empty for a reason the user
+                  can't see otherwise; say so instead of "no users found". Only
+                  Stalwart 1.0's own refusal says who is still listed and what
+                  an administrator can do: a 0.16 role without the permission
+                  gets another refusal, and a list of everyone after it. */}
+              {!loadingPrincipals && directoryStatus !== "ok" && (
+                <p className="text-xs text-muted-foreground" role="status">
+                  {directoryStatus === "error"
+                    ? t("directory_failed")
+                    : directoryQueriesOff ? t("directory_restricted") : t("directory_not_browsable")}
+                </p>
+              )}
               <div className="max-h-48 overflow-y-auto -mx-1">
                 {loadingPrincipals && (
                   <div className="flex items-center justify-center py-4 text-muted-foreground">
@@ -340,7 +268,7 @@ export function ShareCollectionDialog({
                     {t("loading_principals")}
                   </div>
                 )}
-                {!loadingPrincipals && filteredPrincipals.length === 0 && (
+                {!loadingPrincipals && filteredPrincipals.length === 0 && (search.trim() || directoryStatus === "ok") && (
                   <div className="text-xs text-muted-foreground text-center py-3">
                     {search.trim() ? t("no_match") : t("no_principals")}
                   </div>
@@ -363,13 +291,13 @@ export function ShareCollectionDialog({
                         <div className="text-sm font-medium truncate flex items-center gap-2">
                           {p.name}
                           {p.type === "group" && (
-                            <span className="text-[10px] uppercase font-normal text-muted-foreground bg-muted rounded px-1 py-0.5">
+                            <span className="text-[0.6875rem] font-normal text-muted-foreground bg-muted rounded px-1 py-0.5">
                               {t("group")}
                             </span>
                           )}
                         </div>
                         {p.email && p.email !== p.name && (
-                          <div className="text-xs text-muted-foreground truncate">{p.email}</div>
+                          <div dir="ltr" className="text-xs text-muted-foreground truncate rtl:text-right">{p.email}</div>
                         )}
                       </div>
                       {savingId === p.id && <Loader2 className="w-4 h-4 animate-spin" />}
@@ -386,10 +314,6 @@ export function ShareCollectionDialog({
           )}
         </div>
 
-        <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-border">
-          <Button onClick={onClose}>{tCommon("close")}</Button>
-        </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }

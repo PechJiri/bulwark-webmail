@@ -1,7 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { rejectCrossOriginRequest } from '@/lib/security/same-origin';
 import { logger } from '@/lib/logger';
+import { configManager } from '@/lib/admin/config-manager';
 import { getStalwartCredentials } from '@/lib/stalwart/credentials';
+import { loginClientAddress } from '@/lib/auth/client-address';
 import { JmapRedirectError, fetchJmapSession, postJmap, rebaseApiUrl } from '@/lib/stalwart/jmap-api';
+import { DisallowedUrlError } from '@/lib/security/url-guard';
+import { UpstreamBodyTooLargeError, readTextCapped } from '@/lib/security/capped-body';
+
+/** Large JMAP answers pass through (logs, principal lists); a server streaming without end does not. */
+const MAX_RESPONSE_BYTES = 50 * 1024 * 1024;
 
 /**
  * POST /api/account/stalwart/jmap
@@ -16,6 +24,22 @@ import { JmapRedirectError, fetchJmapSession, postJmap, rebaseApiUrl } from '@/l
  * methods under the `x:` namespace on the same endpoint.
  */
 export async function POST(request: NextRequest) {
+  // CSRF gate (GHSA-9mvj-98f5-9q6g): this handler acts with the caller's
+  // session cookie, which SameSite=Lax still sends from a same-site page.
+  const crossOrigin = rejectCrossOriginRequest(request);
+  if (crossOrigin) return crossOrigin;
+  // Registered unconditionally by Next, so the switch lives here: when the
+  // passthrough (or Stalwart features as a whole) is disabled the route
+  // does not exist as far as callers are concerned. Checked before the
+  // credential lookup so a disabled route never touches the session. (#904)
+  await configManager.ensureLoaded();
+  const passthroughEnabled =
+    configManager.get<boolean>('stalwartFeaturesEnabled', true) &&
+    configManager.get<boolean>('stalwartJmapPassthroughEnabled', true);
+  if (!passthroughEnabled) {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 });
+  }
+
   try {
     const creds = await getStalwartCredentials(request);
     if (!creds) {
@@ -24,17 +48,18 @@ export async function POST(request: NextRequest) {
 
     const body = await request.text();
 
+    const fetchOptions = { trusted: creds.trusted, clientIp: loginClientAddress(request) };
     const directUrl = `${creds.serverUrl}/jmap/`;
-    let response = await postJmap(directUrl, creds.authHeader, body);
+    let response = await postJmap(directUrl, creds.authHeader, body, fetchOptions);
 
     if (response.status === 404) {
       // `${serverUrl}/jmap/` is not the API endpoint on this deployment
       // (path prefix, non-Stalwart URL layout). Resolve the session's
       // advertised apiUrl on the same host and retry once.
-      const session = await fetchJmapSession(creds.serverUrl, creds.authHeader);
+      const session = await fetchJmapSession(creds.serverUrl, creds.authHeader, fetchOptions);
       const apiUrl = rebaseApiUrl(session, creds.serverUrl);
       if (apiUrl && apiUrl !== directUrl) {
-        response = await postJmap(apiUrl, creds.authHeader, body);
+        response = await postJmap(apiUrl, creds.authHeader, body, fetchOptions);
       }
     }
 
@@ -45,7 +70,7 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    const responseText = await response.text();
+    const responseText = await readTextCapped(response, MAX_RESPONSE_BYTES);
     return new NextResponse(responseText, {
       status: response.status,
       headers: { 'Content-Type': response.headers.get('Content-Type') || 'application/json' },
@@ -54,6 +79,14 @@ export async function POST(request: NextRequest) {
     if (error instanceof JmapRedirectError) {
       logger.error('Stalwart JMAP passthrough redirect error', { error: error.message });
       return NextResponse.json({ error: error.message }, { status: 502 });
+    }
+    if (error instanceof DisallowedUrlError) {
+      logger.warn('Stalwart JMAP passthrough refused non-public server address', { error: error.message });
+      return NextResponse.json({ error: 'JMAP server address is not allowed' }, { status: 502 });
+    }
+    if (error instanceof UpstreamBodyTooLargeError) {
+      logger.warn('Stalwart JMAP passthrough response too large', { maxBytes: error.maxBytes });
+      return NextResponse.json({ error: 'JMAP server response is too large' }, { status: 502 });
     }
     // `fetch failed` from undici is too generic to debug — the real reason
     // (ENOTFOUND, ECONNREFUSED, self-signed TLS, …) lives on `error.cause`.

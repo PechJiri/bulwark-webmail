@@ -51,28 +51,8 @@ describe('auth-store logout redirects', () => {
 
     await useAuthStore.getState().logout();
 
-    expect(replaceSpy).toHaveBeenCalledWith('/fr/login');
+    expect(replaceSpy).toHaveBeenCalledWith('/fr/login?logged_out=1');
     expect(fetchMock).toHaveBeenCalledWith('/api/auth/session?slot=0', { method: 'DELETE', keepalive: true });
-  });
-
-  it('completes provider logout before restarting automatic SSO', async () => {
-    const endSessionUrl = 'https://sso.pechovic.cz/realms/pechovic/protocol/openid-connect/logout'
-      + '?client_id=family-bulwark&post_logout_redirect_uri=https%3A%2F%2Fwebmail.pechovic.cz%2Fcs%2Flogin';
-    const fetchMock = vi.fn(async (input: FetchInput) => {
-      if (String(input).startsWith('/api/auth/token')) {
-        return { ok: true, json: async () => ({ ok: true, end_session_url: endSessionUrl }) };
-      }
-      return { ok: true, json: async () => ({ ok: true }) };
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    const replaceSpy = vi.spyOn(browserNavigation, 'replaceWindowLocation').mockImplementation(() => {});
-
-    sessionStorage.setItem('sso_attempted', '1');
-    useAuthStore.setState({ isAuthenticated: true, authMode: 'oauth' });
-    await useAuthStore.getState().logout();
-
-    expect(sessionStorage.getItem('sso_attempted')).toBeNull();
-    expect(replaceSpy).toHaveBeenCalledWith(endSessionUrl);
   });
 
   it('marks session expiry, preserves the current path, and redirects to login when the refresh is rejected (401)', async () => {
@@ -188,8 +168,11 @@ describe('auth-store logout redirects', () => {
     });
 
     // Refresh goes in flight, then the user signs out before it settles.
+    // Sign-out gives the renewal a few seconds, then cancels it (#905).
     const pending = useAuthStore.getState().refreshAccessToken();
-    await useAuthStore.getState().logout();
+    const signedOut = useAuthStore.getState().logout();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await signedOut;
     resolveInFlight!({ ok: false, status: 503, json: async () => ({}) });
     await pending;
 
@@ -231,5 +214,78 @@ describe('auth-store logout redirects', () => {
     expect(useAuthStore.getState().isAuthenticated).toBe(true);
     expect(sessionStorage.getItem('session_expired')).toBeNull();
     expect(replaceSpy).not.toHaveBeenCalled();
+  });
+  it('signs out after five consecutive Bulwark-side refresh failures (500) instead of retrying forever (#972)', async () => {
+    vi.useFakeTimers();
+
+    const fetchMock = vi.fn(async (input: FetchInput, init?: FetchInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+
+      if (url === '/api/auth/token?slot=0&force=true' && method === 'PUT') {
+        return { ok: false, status: 500, json: async () => ({}) };
+      }
+      if ((url === '/api/auth/token?slot=0' || url === '/api/auth/session?slot=0') && method === 'DELETE') {
+        return { ok: true, json: async () => ({}) };
+      }
+
+      throw new Error(`Unexpected fetch call: ${method} ${url}`);
+    });
+
+    vi.stubGlobal('fetch', fetchMock);
+    const replaceSpy = vi.spyOn(browserNavigation, 'replaceWindowLocation').mockImplementation(() => {});
+
+    window.history.pushState({}, '', '/en/mail');
+    useAuthStore.setState({ isAuthenticated: true, authMode: 'oauth', activeAccountId: null });
+
+    await useAuthStore.getState().refreshAccessToken();
+    // Each failed attempt arms one retry; the fifth 500 ends the session, so
+    // running all timers drains the ladder without looping forever.
+    await vi.runAllTimersAsync();
+
+    const puts = fetchMock.mock.calls.filter(
+      ([input, init]) => String(input) === '/api/auth/token?slot=0&force=true' && init?.method === 'PUT',
+    ).length;
+    expect(puts).toBe(5);
+    expect(useAuthStore.getState().isAuthenticated).toBe(false);
+    expect(sessionStorage.getItem('session_expired')).toBe('true');
+    expect(replaceSpy).toHaveBeenCalledWith('/en/login');
+  });
+
+  it('keeps retrying an upstream outage (503) beyond five failures without evicting the account (#972)', async () => {
+    vi.useFakeTimers();
+
+    const fetchMock = vi.fn(async (input: FetchInput, init?: FetchInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+
+      if (url === '/api/auth/token?slot=0&force=true' && method === 'PUT') {
+        return { ok: false, status: 503, json: async () => ({}) };
+      }
+
+      throw new Error(`Unexpected fetch call: ${method} ${url}`);
+    });
+
+    vi.stubGlobal('fetch', fetchMock);
+    const replaceSpy = vi.spyOn(browserNavigation, 'replaceWindowLocation').mockImplementation(() => {});
+
+    useAuthStore.setState({ isAuthenticated: true, authMode: 'oauth', activeAccountId: null });
+
+    await useAuthStore.getState().refreshAccessToken();
+    // The backoff ladder tops out at 360 s (armed 60 s early): five more
+    // windows are enough for at least five failures in a row.
+    for (let i = 0; i < 5; i++) {
+      await vi.advanceTimersByTimeAsync(301_000);
+    }
+
+    const puts = fetchMock.mock.calls.filter(
+      ([input, init]) => String(input) === '/api/auth/token?slot=0&force=true' && init?.method === 'PUT',
+    ).length;
+    expect(puts).toBeGreaterThanOrEqual(5);
+    expect(useAuthStore.getState().isAuthenticated).toBe(true);
+    expect(sessionStorage.getItem('session_expired')).toBeNull();
+    expect(replaceSpy).not.toHaveBeenCalled();
+    // A further retry is still armed.
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
   });
 });

@@ -18,7 +18,7 @@ Everything here is self-contained and separate from the app's root
 Provisioned mailboxes (domain `example.org`, shared password `test-pass-123`):
 `alice`, `bob`, `carol`. Admin: `admin` / `bootstrap-secret`.
 
-### Two things worth knowing
+### Three things worth knowing
 
 - **The webmail runs in Next.js dev mode.** The browser talks JMAP *directly*
   to Stalwart at `http://localhost:8025` (cross-origin, plain HTTP). The app's
@@ -28,6 +28,16 @@ Provisioned mailboxes (domain `example.org`, shared password `test-pass-123`):
 - **CORS.** Stalwart doesn't emit CORS headers by default. The bootstrap enables
   `usePermissiveCors` (see `stalwart/plan-accounts.ndjson.tpl`) so the browser
   origin (`:3000`) may call the JMAP origin (`:8025`).
+- **Directory queries.** The sharing specs look up principals with
+  `Principal/query`, which Stalwart 1.0 refuses (`forbidden`) unless the
+  Sharing setting `allowDirectoryQueries` is on. The bootstrap turns it on
+  (0.16 has the same setting).
+
+The Stalwart release under test is the `STALWART_IMAGE` build argument
+(default `stalwartlabs/stalwart:v0.16`), e.g.
+`STALWART_IMAGE=<a 1.0 image> integration/run-tests.sh`. Remove the volumes
+(`docker compose down -v`) before switching releases: 1.0 cannot open a 0.16
+data directory.
 
 ## Running
 
@@ -43,6 +53,19 @@ integration/run-tests.sh 01-login
 `run-tests.sh` is the recommended entry point because Playwright's browser
 bundles can't always be downloaded/installed on the host; the official
 `mcr.microsoft.com/playwright` image sidesteps that.
+
+### In CI
+
+The "Integration tests" workflow (`.github/workflows/integration.yml`) runs
+`run-tests.sh` every night on main, on pull requests that carry the
+`integration` label, and on demand:
+
+```bash
+gh workflow run integration.yml
+```
+
+A failed run uploads the Playwright report, traces and failure videos as the
+`integration-report` artifact and prints the container logs.
 
 ### Running against a host browser instead
 
@@ -106,13 +129,13 @@ because the UI behaviour is currently incomplete. Worth a look:
   runs — they follow the reconcile, not the optimistic path.
 - **`mark-as-spam` doesn't optimistically decrement the source counter** the
   way `delete` does; it settles after a reconcile.
-- **Reopening a draft resets the From selector** to the default identity even
-  though the draft was saved with (and the server retains) the chosen sender.
-  Pinned with `test.fail` in `07-drafts`.
-- **Cross-account moves (own ⇆ shared folder) don't relocate the message.** The
-  "Move to" submenu offers the shared folder, but clicking it is a no-op.
-  Shared ⇆ shared (same owner) moves work. Pinned with `test.fail` in
-  `08-shared-moves`.
+- **Reopening a draft restores the chosen sender (fixed).** It used to reset
+  the From selector to the default identity (`08-drafts`).
+- **Cross-account moves (fixed).** Moves between the own account and shared
+  folders, and across owners, deliver the message, keep its read state and
+  remove the source (`09-shared-moves`). The client destroys the source itself
+  instead of using Stalwart's `onSuccessDestroyOriginal` (support.stalw.art
+  #1150).
 - **Cross-account attachments & inline images (fixed).** Blobs are account-
   scoped, so viewing/downloading/previewing an attachment, rendering an inline
   `cid:` image, dragging out, and the bundle/S-MIME/TNEF/embedded-message
@@ -145,6 +168,7 @@ because the UI behaviour is currently incomplete. Worth a look:
 | `IT_WEBMAIL_URL`| `http://localhost:3000` | Webmail origin                                        |
 | `IT_JMAP_URL`   | `http://localhost:8025` | Stalwart JMAP/admin base URL                          |
 | `IT_SMTP_PORT`  | `1025`             | Stalwart submission port                                   |
+| `IT_ACCOUNT_USERS` | `alice,bob,carol` | Local parts of the three test accounts, for a stack with other users |
 | `IT_VIDEO`      | `retain-on-failure`| Video capture: `on` records a `.webm` for **every** test; also `off` / `on-first-retry`. Videos land at `integration/test-results/<test>/video.webm` |
 
 Record videos for a whole run (passing tests included):

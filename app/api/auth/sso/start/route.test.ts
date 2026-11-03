@@ -82,4 +82,24 @@ describe('GET /api/auth/sso/start', () => {
     expect(location.searchParams.get('redirect_uri'))
       .toBe('https://webmail.pechovic.cz/cs/auth/callback');
   });
+
+  it('includes the configured mount prefix once in the localized callback', async () => {
+    const original = new NextRequest(
+      'https://webmail.example.com/webmail/api/auth/sso/start?locale=cs&return=redirect',
+      { nextConfig: { basePath: '/webmail' } },
+    );
+    // Model Next's route wrapper: it exposes URL/header data but is not itself
+    // a native Request branded for the current NextRequest constructor.
+    const request = {
+      url: original.url,
+      headers: original.headers,
+      nextUrl: original.nextUrl,
+    } as NextRequest;
+    const response = await GET(request);
+
+    expect(response.status).toBe(307);
+    const location = new URL(response.headers.get('location')!);
+    expect(location.searchParams.get('redirect_uri'))
+      .toBe('https://webmail.example.com/webmail/cs/auth/callback');
+  });
 });

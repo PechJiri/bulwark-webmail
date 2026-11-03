@@ -1,13 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { rejectCrossOriginRequest } from '@/lib/security/same-origin';
 import { cookies } from 'next/headers';
 import { logger } from '@/lib/logger';
 import { decryptSession } from '@/lib/auth/crypto';
 import { sessionCookieName } from '@/lib/auth/session-cookie';
 import { readStalwartAuthContextFromStore } from '@/lib/stalwart/auth-context';
-import { saveUserSettings, loadUserSettings, deleteUserSettings } from '@/lib/settings-sync';
+import { updateUserSettings, loadUserSettings, deleteUserSettings } from '@/lib/settings-sync';
 import { configManager } from '@/lib/admin/config-manager';
+import { resolvePolicy } from '@/lib/admin/policy-scopes';
 import { hasSessionSecret } from '@/lib/auth/session-secret';
 import { MAX_ACCOUNT_SLOTS } from '@/lib/account-utils';
+import { mergeStoredTemplates } from '@/lib/template-merge';
+import { mergeStoredSubscriptions } from '@/lib/calendar-subscription-sync';
+import { storedDataUnavailableResponse } from '@/lib/stored-data-errors';
+
+/** Largest settings blob a client may store (templates and signatures included). */
+const SETTINGS_MAX_BYTES = 2 * 1024 * 1024;
 
 function classifyError(error: unknown): { message: string; status: number } {
   const code = (error as NodeJS.ErrnoException).code;
@@ -62,35 +70,53 @@ function normalizeUrl(url: string): string {
 }
 
 /**
+ * The server address settings are stored under. Identity matching ignores
+ * trailing slashes, so every extra one would key another blob of up to
+ * SETTINGS_MAX_BYTES on disk. Clients send the address with or without a
+ * single slash, and both keep the key they have always had.
+ */
+function storageServerUrl(url: string): string {
+  return url.replace(/\/{2,}$/, '/');
+}
+
+/**
  * Verify identity against session cookies across all account slots.
  * With multi-account, the requesting account may be on any slot.
  * Checks both basic-auth session cookies and stalwart auth context cookies
  * (used by OAuth/SSO and TOTP-upgraded sessions).
- * Returns true only if a matching cookie is found.
+ * Returns the account name to key the settings on, or null when no cookie
+ * matches. That is the cookie's `accountName` when it has one: a Bearer
+ * login claimed with a bare local part must not share `john`'s settings
+ * with every other `john` on a multi-domain server.
  */
-async function verifyIdentity(username: string, serverUrl: string): Promise<boolean> {
+async function verifyIdentity(username: string, serverUrl: string): Promise<string | null> {
   const cookieStore = await cookies();
   const normalizedServerUrl = normalizeUrl(serverUrl);
 
   for (let slot = 0; slot < MAX_ACCOUNT_SLOTS; slot++) {
-    // Check basic-auth session cookie
+    // The context cookie first: it is the one that knows the account name,
+    // and every sign-in path that writes the session cookie writes it too.
+    const ctx = readStalwartAuthContextFromStore(cookieStore, slot);
+    if (ctx && ctx.username === username && normalizeUrl(ctx.serverUrl) === normalizedServerUrl) {
+      return ctx.accountName ?? username;
+    }
+
+    // Remember-me session cookie without a context (older sign-ins). A
+    // password login proves exactly the claimed name; a token login may have
+    // claimed a bare local part that only the context could resolve, so it
+    // does not key anything on its own.
     const token = cookieStore.get(sessionCookieName(slot))?.value;
     if (token) {
       const session = decryptSession(token);
       if (session && session.username === username && normalizeUrl(session.serverUrl) === normalizedServerUrl) {
-        return true;
+        if ('token' in session && session.token && !username.includes('@')) continue;
+        return username;
       }
-    }
-
-    // Check stalwart auth context cookie (set for all auth modes)
-    const ctx = readStalwartAuthContextFromStore(cookieStore, slot);
-    if (ctx && ctx.username === username && normalizeUrl(ctx.serverUrl) === normalizedServerUrl) {
-      return true;
     }
   }
 
   // No matching session found (or no cookies at all) → reject
-  return false;
+  return null;
 }
 
 export async function GET(request: NextRequest) {
@@ -104,29 +130,45 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Missing identity headers' }, { status: 400 });
   }
 
-  if (!(await verifyIdentity(username, serverUrl))) {
+  const accountName = await verifyIdentity(username, serverUrl);
+  if (!accountName) {
     return NextResponse.json({ error: 'Identity mismatch' }, { status: 403 });
   }
 
   try {
-    const settings = await loadUserSettings(username, serverUrl);
+    const settings = await loadUserSettings(accountName, storageServerUrl(serverUrl));
     return NextResponse.json({ settings: settings || null });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     const code = (error as NodeJS.ErrnoException).code;
     logger.error('Settings load error', { error: message, code });
+    const unavailable = storedDataUnavailableResponse(error);
+    if (unavailable) return unavailable;
     const classified = classifyError(error);
     return NextResponse.json({ error: classified.message }, { status: classified.status });
   }
 }
 
 export async function POST(request: NextRequest) {
+  // CSRF gate (GHSA-9mvj-98f5-9q6g): this handler acts with the caller's
+  // session cookie, which SameSite=Lax still sends from a same-site page.
+  const crossOrigin = rejectCrossOriginRequest(request);
+  if (crossOrigin) return crossOrigin;
   if (!isEnabled()) {
     return NextResponse.json({ error: 'Settings sync is disabled' }, { status: 404 });
   }
 
   try {
-    const { username, serverUrl, settings } = await request.json();
+    // One settings blob per account, read back on every sync: bound it
+    // before parsing, the way the account archive is.
+    if (Number(request.headers.get('content-length') ?? 0) > SETTINGS_MAX_BYTES) {
+      return NextResponse.json({ error: 'Settings are too large' }, { status: 413 });
+    }
+    const text = await request.text();
+    if (text.length > SETTINGS_MAX_BYTES) {
+      return NextResponse.json({ error: 'Settings are too large' }, { status: 413 });
+    }
+    const { username, serverUrl, settings } = JSON.parse(text);
     if (!username || !serverUrl || !settings) {
       return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
     }
@@ -135,13 +177,16 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Settings must be an object' }, { status: 400 });
     }
 
-    if (!(await verifyIdentity(username, serverUrl))) {
+    const accountName = await verifyIdentity(username, serverUrl);
+    if (!accountName) {
       return NextResponse.json({ error: 'Identity mismatch' }, { status: 403 });
     }
 
     // Enforce admin policy - strip locked settings so users can't override them
     await configManager.ensureLoaded();
-    const policy = configManager.getPolicy();
+    // With the account's domain scopes applied; group scopes need the
+    // account's session, which only the client has, so the client enforces those.
+    const policy = resolvePolicy(configManager.getPolicy(), { email: accountName, groups: [] }).policy;
     const filteredSettings = { ...settings };
     for (const key of Object.keys(filteredSettings)) {
       const restriction = policy.restrictions[key];
@@ -166,18 +211,34 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    await saveUserSettings(username, serverUrl, filteredSettings);
+    // Templates and iCal subscriptions are merged into the stored blob rather
+    // than replaced, so a stale tab or device cannot drop ones another added.
+    // In one step against what is stored now: two saves at once (two tabs,
+    // two replicas) each keep the other's additions.
+    await updateUserSettings(
+      accountName,
+      storageServerUrl(serverUrl),
+      (stored) => mergeStoredSubscriptions(stored, mergeStoredTemplates(stored, filteredSettings)),
+    );
     return NextResponse.json({ ok: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     const code = (error as NodeJS.ErrnoException).code;
     logger.error('Settings save error', { error: message, code });
+    // Stored settings that don't decrypt, or no store: write nothing, so
+    // the user's real settings survive and the client keeps its copy.
+    const unavailable = storedDataUnavailableResponse(error);
+    if (unavailable) return unavailable;
     const classified = classifyError(error);
     return NextResponse.json({ error: classified.message }, { status: classified.status });
   }
 }
 
 export async function DELETE(request: NextRequest) {
+  // CSRF gate (GHSA-9mvj-98f5-9q6g): this handler acts with the caller's
+  // session cookie, which SameSite=Lax still sends from a same-site page.
+  const crossOrigin = rejectCrossOriginRequest(request);
+  if (crossOrigin) return crossOrigin;
   if (!isEnabled()) {
     return NextResponse.json({ error: 'Settings sync is disabled' }, { status: 404 });
   }
@@ -188,16 +249,19 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
     }
 
-    if (!(await verifyIdentity(username, serverUrl))) {
+    const accountName = await verifyIdentity(username, serverUrl);
+    if (!accountName) {
       return NextResponse.json({ error: 'Identity mismatch' }, { status: 403 });
     }
 
-    await deleteUserSettings(username, serverUrl);
+    await deleteUserSettings(accountName, storageServerUrl(serverUrl));
     return NextResponse.json({ ok: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     const code = (error as NodeJS.ErrnoException).code;
     logger.error('Settings delete error', { error: message, code });
+    const unavailable = storedDataUnavailableResponse(error);
+    if (unavailable) return unavailable;
     const classified = classifyError(error);
     return NextResponse.json({ error: classified.message }, { status: classified.status });
   }

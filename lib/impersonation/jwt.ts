@@ -26,6 +26,13 @@ const MAX_TOKEN_LIFETIME_SEC = 300;
 const CLOCK_SKEW_SEC = 60;
 const MIN_SECRET_LENGTH = 32;
 
+/**
+ * How long after it is first redeemed a token can still verify: `iat` may
+ * run CLOCK_SKEW_SEC ahead, `exp` is at most MAX_TOKEN_LIFETIME_SEC after
+ * `iat`, and `exp` is honoured for another CLOCK_SKEW_SEC.
+ */
+export const IMPERSONATION_REPLAY_WINDOW_SEC = MAX_TOKEN_LIFETIME_SEC + 2 * CLOCK_SKEW_SEC;
+
 function base64UrlDecode(input: string): Buffer {
   const pad = input.length % 4 === 0 ? 0 : 4 - (input.length % 4);
   const b64 = input.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat(pad);
@@ -141,17 +148,21 @@ export function verifyImpersonationJwt(
 
 // ─── Replay protection ──────────────────────────────────────────
 // In-memory LRU keyed by jti. Entries expire automatically once their
-// underlying JWT could no longer be replayed (exp + skew). On a multi-pod
-// deployment each pod has its own cache; that's acceptable because a token
-// stolen mid-flight could only be replayed against the pod that already
-// consumed it (and that pod will reject it). For stronger guarantees,
-// platforms can issue per-pod-routed tokens or front Bulwark with a
-// single-leader load balancer for the impersonate route.
+// underlying JWT could no longer be replayed (exp + skew). This is the fast
+// path; consumeImpersonationJti() in replay-store.ts backs it with marker
+// files in the state directory so a restart or another replica sharing the
+// state volume still refuses a used token.
 
 const REPLAY_CACHE_MAX = 4096;
 
 class ReplayCache {
   private entries = new Map<string, number>(); // jti -> exp epoch seconds
+
+  /** Whether jti was recorded and could still verify. */
+  has(jti: string, now: number = Math.floor(Date.now() / 1000)): boolean {
+    this.prune(now);
+    return this.entries.has(jti);
+  }
 
   /** Returns true if jti was not previously seen and has been recorded. */
   consume(jti: string, exp: number, now: number = Math.floor(Date.now() / 1000)): boolean {
@@ -186,4 +197,6 @@ class ReplayCache {
   }
 }
 
-export const impersonationReplayCache = new ReplayCache();
+// One per process, not one per bundle: the route bundles each evaluate this module.
+const REPLAY_CACHE_KEY = Symbol.for('bulwark.impersonationReplayCache');
+export const impersonationReplayCache: ReplayCache = ((globalThis as typeof globalThis & { [REPLAY_CACHE_KEY]?: ReplayCache })[REPLAY_CACHE_KEY] ??= new ReplayCache());

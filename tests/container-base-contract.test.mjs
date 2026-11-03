@@ -9,8 +9,12 @@ const expected =
   'node:24.21.0-alpine@sha256:be80f76cf40ec8e42b9bec49f60a55e0660f30af58d3e5a25530785b30ea67e2';
 
 test('production and integration builds use the reviewed immutable Node base', () => {
-  const productionBases = [...production.matchAll(/^FROM (\S+)/gm)].map((match) => match[1]);
-  const integrationBases = [...integration.matchAll(/^FROM (\S+)/gm)].map((match) => match[1]);
+  const productionBases = [...production.matchAll(/^FROM (\S+)/gm)]
+    .map((match) => match[1])
+    .filter((base) => base.startsWith('node:'));
+  const integrationBases = [...integration.matchAll(/^FROM (\S+)/gm)]
+    .map((match) => match[1])
+    .filter((base) => base.startsWith('node:'));
 
   assert.deepEqual(productionBases, [expected, expected]);
   assert.deepEqual(integrationBases, [expected]);

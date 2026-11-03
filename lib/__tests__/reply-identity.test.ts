@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findComposeIdentityId, findDraftIdentityId, findReplyIdentityId, resolveComposeAccountEmail, resolveReplyFrom } from '../reply-identity';
+import { deliveryAddresses, findComposeIdentityId, findDraftIdentityId, findReplyIdentityId, resolveComposeAccountEmail, resolveReplyFrom } from '../reply-identity';
 import type { Identity } from '../jmap/types';
 
 const identities: Identity[] = [
@@ -79,6 +79,62 @@ describe('findReplyIdentityId', () => {
 
     expect(selected).toBeNull();
   });
+
+  // The shared-mailbox shape: the team address in To, the member's own address
+  // in Cc. Scanning identities rather than recipients would answer with the
+  // member, because sortIdentities puts the login's own address first - i.e.
+  // exactly the "it replied as me again" complaint.
+  const shared: Identity[] = [
+    { id: 'owner', name: 'Owner', email: 'owner@example.com', mayDelete: false },
+    { id: 'team', name: 'Team', email: 'team@example.com', mayDelete: false },
+  ];
+
+  it('prefers a To recipient over a Cc one, whatever order the identities are in', () => {
+    const selected = findReplyIdentityId(shared, {
+      to: [{ email: 'team@example.com' }],
+      cc: [{ email: 'owner@example.com' }],
+    });
+
+    expect(selected).toBe('team');
+  });
+
+  it('ranks a Bcc identity below the address in To', () => {
+    const withArchive: Identity[] = [
+      { id: 'archive', name: 'Archive', email: 'archive@example.com', mayDelete: false },
+      { id: 'team', name: 'Team', email: 'team@example.com', mayDelete: false },
+    ];
+
+    const selected = findReplyIdentityId(withArchive, {
+      to: [{ email: 'team@example.com' }],
+      bcc: [{ email: 'archive@example.com' }],
+    });
+
+    expect(selected).toBe('team');
+  });
+
+  it('takes an exact match anywhere over a sub-address match in To', () => {
+    const selected = findReplyIdentityId(identities, {
+      to: [{ email: 'harry+news@primary.com' }],
+      cc: [{ email: 'harry@secondary.com' }],
+    });
+
+    expect(selected).toBe('secondary');
+  });
+
+  // A `+tag` identifies who the address was given to, so a delivery to an
+  // unknown tag must not answer with a sibling's tag and disclose it.
+  it('prefers the untagged identity over a differently-tagged sibling', () => {
+    const tagged: Identity[] = [
+      { id: 'eu', name: 'Sales EU', email: 'sales+eu@example.com', mayDelete: false },
+      { id: 'sales', name: 'Sales', email: 'sales@example.com', mayDelete: false },
+    ];
+
+    const selected = findReplyIdentityId(tagged, {
+      to: [{ email: 'sales+us@example.com' }],
+    });
+
+    expect(selected).toBe('sales');
+  });
 });
 
 describe('findComposeIdentityId', () => {
@@ -133,9 +189,90 @@ describe('resolveReplyFrom', () => {
     expect(result).toEqual({ identityId: 'primary' });
   });
 
+  // #1000: a domain whose extra addresses are distribution lists, not
+  // catch-all aliases. Exact mode keeps the identity matching but never
+  // surfaces a From override.
+  it('returns null instead of a catch-all override in exact mode', () => {
+    expect(resolveReplyFrom(identities, { to: [{ email: 'stripe@primary.com', name: 'Stripe' }] }, 'exact'))
+      .toBeNull();
+  });
+
+  it('still matches configured identities (exact and +tag) in exact mode', () => {
+    expect(resolveReplyFrom(identities, { to: [{ email: 'harry@secondary.com' }] }, 'exact'))
+      .toEqual({ identityId: 'secondary' });
+    expect(resolveReplyFrom(identities, { to: [{ email: 'harry+news@primary.com' }] }, 'exact'))
+      .toEqual({ identityId: 'primary' });
+  });
+
   it('returns null when recipients are on foreign domains', () => {
     expect(resolveReplyFrom(identities, { to: [{ email: 'nobody@elsewhere.com' }] }))
       .toBeNull();
+  });
+
+  // #1353: a GitHub notification is addressed to the repo, and the catch-all
+  // alias it was delivered to only shows up in Delivered-To.
+  const github = { to: [{ email: 'repo@noreply.github.com', name: 'owner/repo' }] };
+
+  it('takes the delivery address as catch-all override when To/Cc/Bcc have none', () => {
+    expect(resolveReplyFrom(identities, { ...github, deliveredTo: ['github@primary.com'] })).toEqual({
+      identityId: 'primary',
+      overrideEmail: 'github@primary.com',
+      overrideName: undefined,
+    });
+  });
+
+  it('matches a delivery address that is an identity', () => {
+    expect(resolveReplyFrom(identities, { ...github, deliveredTo: ['harry@secondary.com'] }, 'exact'))
+      .toEqual({ identityId: 'secondary' });
+  });
+
+  it('keeps a catch-all address in To ahead of the mailbox it was delivered to', () => {
+    expect(resolveReplyFrom(identities, {
+      to: [{ email: 'sales@primary.com', name: 'Sales' }],
+      deliveredTo: ['harry@primary.com'],
+    })).toEqual({ identityId: 'primary', overrideEmail: 'sales@primary.com', overrideName: 'Sales' });
+  });
+
+  it('never makes a delivery address an override in exact mode', () => {
+    expect(resolveReplyFrom(identities, { ...github, deliveredTo: ['github@primary.com'] }, 'exact'))
+      .toBeNull();
+  });
+
+  it('ignores delivery addresses on foreign domains', () => {
+    expect(resolveReplyFrom(identities, { ...github, deliveredTo: ['me@gmail.com'] })).toBeNull();
+  });
+});
+
+describe('findReplyIdentityId with delivery addresses', () => {
+  it('falls back to the delivery address when To/Cc/Bcc have no identity', () => {
+    expect(findReplyIdentityId(identities, {
+      to: [{ email: 'list@lists.example.org' }],
+      deliveredTo: ['harry+lists@secondary.com'],
+    })).toBe('secondary');
+  });
+
+  it('prefers an identity in To over the delivery address', () => {
+    expect(findReplyIdentityId(identities, {
+      to: [{ email: 'harry@secondary.com' }],
+      deliveredTo: ['harry@primary.com'],
+    })).toBe('secondary');
+  });
+});
+
+describe('deliveryAddresses', () => {
+  it('reads the delivery headers in priority order, case-insensitively, without duplicates', () => {
+    expect(deliveryAddresses({
+      'X-Original-To': ' alias@primary.com',
+      'delivered-to': [' github@primary.com', ' harry@gmail.com'],
+      'X-Delivered-to': '<GitHub@primary.com>',
+      'X-Original-Delivered-To': 'mailing list list@lists.example.org',
+      Subject: 'not@an-address.com',
+    })).toEqual(['github@primary.com', 'harry@gmail.com', 'alias@primary.com', 'list@lists.example.org']);
+  });
+
+  it('returns nothing when there are no headers or no address in them', () => {
+    expect(deliveryAddresses(undefined)).toEqual([]);
+    expect(deliveryAddresses({ 'Delivered-To': 'nobody' })).toEqual([]);
   });
 });
 

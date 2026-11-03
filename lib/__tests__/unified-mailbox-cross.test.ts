@@ -6,6 +6,7 @@ import {
   buildCrossFilter,
   getCrossUnreadTotal,
   fetchCrossViewEmails,
+  searchCrossViewEmails,
   advancedSearchCrossViewEmails,
   resolveSourceFolderName,
   type UnifiedAccountClient,
@@ -42,6 +43,14 @@ describe('getCrossIncludedMailboxes', () => {
     });
     const ids = getCrossIncludedMailboxes(account).map((m) => m.id);
     expect(ids).toEqual(['inbox', 'projects']);
+  });
+
+  it('excludes an RFC 6154 All mailbox, which would pull in sent/archive mail (#1241)', () => {
+    const account = makeAccount({
+      accountId: 'a',
+      mailboxes: [mb('inbox', 'inbox'), mb('all', 'all'), mb('sent', 'sent')],
+    });
+    expect(getCrossIncludedMailboxes(account).map((m) => m.id)).toEqual(['inbox']);
   });
 
   it('honors an explicit crossIncludedMailboxIds selection (folder picker)', () => {
@@ -106,6 +115,14 @@ describe('getCrossUnreadTotal', () => {
       mailboxes: [mb('inbox', 'inbox', 5), mb('sent', 'sent', 99)],
     });
     expect(getCrossUnreadTotal([a, b])).toBe(10);
+  });
+
+  it('does not count inbox unread twice through an all mailbox (#1241)', () => {
+    const a = makeAccount({
+      accountId: 'a',
+      mailboxes: [mb('inbox', 'inbox', 1), mb('all', 'all', 1), mb('sent', 'sent', 0)],
+    });
+    expect(getCrossUnreadTotal([a])).toBe(1);
   });
 
   it('counts only the selected folders when crossIncludedMailboxIds is set; shared accounts stay unrestricted', () => {
@@ -205,17 +222,79 @@ describe('fetchCrossViewEmails', () => {
   });
 });
 
-describe('advancedSearchCrossViewEmails', () => {
-  it('ANDs the advanced filter onto the cross-view membership', async () => {
-    const advancedSearchEmails = vi.fn().mockResolvedValue({ emails: [], total: 0, hasMore: false });
-    const a = makeAccount({ accountId: 'a', mailboxes: [mb('inbox', 'inbox')] }, { advancedSearchEmails });
+describe('searchCrossViewEmails', () => {
+  const folders = [mb('inbox', 'inbox'), mb('sent', 'sent'), mb('archive', 'archive'), mb('trash', 'trash'), mb('junk', 'junk')];
 
-    await advancedSearchCrossViewEmails([a], 'all', { hasKeyword: '$flagged' }, 50, 0);
+  it('searches every folder but Trash and Junk from All mail, Sent included', async () => {
+    const advancedSearchEmails = vi.fn().mockResolvedValue({
+      emails: [{ id: 's1', receivedAt: '2026-01-01T10:00:00Z', mailboxIds: { sent: true } } as unknown as Email],
+      total: 1,
+      hasMore: false,
+    });
+    const a = makeAccount({ accountId: 'a', mailboxes: folders }, { advancedSearchEmails });
+
+    const result = await searchCrossViewEmails([a], 'all', 'invoice', 50, 0);
 
     const [filter] = advancedSearchEmails.mock.calls[0];
     expect(filter).toEqual({
       operator: 'AND',
-      conditions: [{ inMailbox: 'inbox' }, { hasKeyword: '$flagged' }],
+      conditions: [{ text: 'invoice' }, { inMailboxOtherThan: ['trash', 'junk'] }],
+    });
+    expect(result.emails.map((e) => e.sourceFolder)).toEqual(['sent']);
+  });
+
+  it('still narrows Starred to its own list', async () => {
+    const advancedSearchEmails = vi.fn().mockResolvedValue({ emails: [], total: 0, hasMore: false });
+    const a = makeAccount({ accountId: 'a', mailboxes: folders }, { advancedSearchEmails });
+
+    await searchCrossViewEmails([a], 'starred', 'invoice', 50, 0);
+
+    const [filter] = advancedSearchEmails.mock.calls[0];
+    expect(filter).toEqual({
+      operator: 'AND',
+      conditions: [
+        { operator: 'AND', conditions: [{ inMailbox: 'inbox' }, { hasKeyword: '$flagged' }] },
+        { text: 'invoice' },
+      ],
+    });
+  });
+});
+
+describe('advancedSearchCrossViewEmails', () => {
+  it('ANDs the advanced filter onto the Unread membership', async () => {
+    const advancedSearchEmails = vi.fn().mockResolvedValue({ emails: [], total: 0, hasMore: false });
+    const a = makeAccount({ accountId: 'a', mailboxes: [mb('inbox', 'inbox')] }, { advancedSearchEmails });
+
+    await advancedSearchCrossViewEmails([a], 'unread', { from: 'bob' }, 50, 0);
+
+    const [filter] = advancedSearchEmails.mock.calls[0];
+    expect(filter).toEqual({
+      operator: 'AND',
+      conditions: [
+        { operator: 'AND', conditions: [{ inMailbox: 'inbox' }, { notKeyword: '$seen' }] },
+        { from: 'bob' },
+      ],
+    });
+  });
+
+  it('searches every folder but Trash and Junk from All mail', async () => {
+    const advancedSearchEmails = vi.fn().mockResolvedValue({ emails: [], total: 0, hasMore: false });
+    const shared = makeAccount(
+      {
+        accountId: 'owner-1',
+        isShared: true,
+        mailboxes: [mb('ns:inbox', 'inbox', 0, 'orig-inbox'), mb('ns:sent', 'sent', 0, 'orig-sent'), mb('ns:trash', 'trash', 0, 'orig-trash')],
+      },
+      { advancedSearchEmails },
+    );
+
+    await advancedSearchCrossViewEmails([shared], 'all', { from: 'bob' }, 50, 0);
+
+    const [filter, accountId] = advancedSearchEmails.mock.calls[0];
+    expect(accountId).toBe('owner-1');
+    expect(filter).toEqual({
+      operator: 'AND',
+      conditions: [{ from: 'bob' }, { inMailboxOtherThan: ['orig-trash'] }],
     });
   });
 
@@ -227,5 +306,30 @@ describe('advancedSearchCrossViewEmails', () => {
 
     const [filter] = advancedSearchEmails.mock.calls[0];
     expect(filter).toEqual({ inMailbox: 'inbox' });
+  });
+});
+
+describe('searchCrossViewEmails', () => {
+  it('ANDs a plain query onto the cross-view membership as one text condition', async () => {
+    const advancedSearchEmails = vi.fn().mockResolvedValue({ emails: [], total: 0, hasMore: false });
+    const a = makeAccount({ accountId: 'a', mailboxes: [mb('inbox', 'inbox')] }, { advancedSearchEmails });
+
+    await searchCrossViewEmails([a], 'unread', 'project budget', 50, 0);
+
+    const [filter] = advancedSearchEmails.mock.calls[0];
+    expect(filter).toEqual({ operator: 'AND', conditions: [buildCrossFilter('unread', ['inbox']), { text: 'project budget' }] });
+  });
+
+  it('gives every quoted phrase and prefix a condition of its own', async () => {
+    const advancedSearchEmails = vi.fn().mockResolvedValue({ emails: [], total: 0, hasMore: false });
+    const a = makeAccount({ accountId: 'a', mailboxes: [mb('inbox', 'inbox'), mb('projects', undefined)] }, { advancedSearchEmails });
+
+    await searchCrossViewEmails([a], 'unread', '"annual report" budg*', 50, 0);
+
+    const [filter] = advancedSearchEmails.mock.calls[0];
+    expect(filter).toEqual({
+      operator: 'AND',
+      conditions: [buildCrossFilter('unread', ['inbox', 'projects']), { text: '"annual report"' }, { text: 'budg*' }],
+    });
   });
 });

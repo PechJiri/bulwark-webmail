@@ -29,12 +29,20 @@ import { useSettingsStore } from "@/stores/settings-store";
 export const AUTO_TIME_ZONE = "auto";
 
 /** The zone the browser reports; `UTC` when detection fails (SSR, old engines). */
+// Resolving the zone builds an Intl formatter, which costs tens of
+// microseconds; the calendar grids convert every event for every day they
+// show, so the answer is kept. The browser zone does not change within a
+// page's lifetime in practice.
+let browserTimeZone: string | null = null;
+
 export function getBrowserTimeZone(): string {
+  if (browserTimeZone) return browserTimeZone;
   try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
   } catch {
-    return "UTC";
+    browserTimeZone = "UTC";
   }
+  return browserTimeZone;
 }
 
 const validityCache = new Map<string, boolean>();
@@ -55,25 +63,42 @@ export function isValidTimeZone(tz: unknown): tz is string {
   return valid;
 }
 
+const canonicalCache = new Map<string, string | null>();
+
 /**
- * Resolve a stored `timeZone` setting to a concrete IANA zone. `auto`, empty
- * or unknown values (a zone synced from a browser with a newer tz database,
- * a hand-edited import) fall back to the browser zone instead of throwing
- * later inside Intl.
+ * `tz` as `Intl` spells it ("europe/berlin" -> "Europe/Berlin"), or null when
+ * `Intl` rejects it. Intl takes a zone in any letter case; Stalwart 1.0
+ * matches the name exactly and refuses one it does not know.
+ */
+export function canonicalTimeZone(tz: string): string | null {
+  let canonical = canonicalCache.get(tz);
+  if (canonical === undefined) {
+    try {
+      canonical = new Intl.DateTimeFormat(undefined, { timeZone: tz }).resolvedOptions().timeZone || null;
+    } catch {
+      canonical = null;
+    }
+    canonicalCache.set(tz, canonical);
+  }
+  return canonical;
+}
+
+/**
+ * Resolve a stored `timeZone` setting to a concrete IANA zone, spelled the
+ * way Intl spells it. `auto`, empty or unknown values (a zone synced from a
+ * browser with a newer tz database, a hand-edited import) fall back to the
+ * browser zone instead of throwing later inside Intl. A zone in another
+ * letter case would be refused by Stalwart 1.0 as an argument, and dropped
+ * from an event by both 0.16 and 1.0, which stored it as floating.
  */
 export function resolveTimeZone(setting: string | null | undefined, browserTimeZone = getBrowserTimeZone()): string {
   if (!setting || setting === AUTO_TIME_ZONE) return browserTimeZone;
-  return isValidTimeZone(setting) ? setting : browserTimeZone;
+  return canonicalTimeZone(setting) ?? browserTimeZone;
 }
 
 /** The zone all instants should be displayed in: the user's override, else the browser's. */
 export function getEffectiveTimeZone(): string {
   return resolveTimeZone(useSettingsStore.getState().timeZone);
-}
-
-/** True when the user's override is active and differs from the browser zone. */
-export function isTimeZoneOverridden(): boolean {
-  return getEffectiveTimeZone() !== getBrowserTimeZone();
 }
 
 export interface WallClock {
@@ -84,6 +109,24 @@ export interface WallClock {
   hour: number;
   minute: number;
   second: number;
+}
+
+/**
+ * Wall-clock fields of a JMAP LocalDateTime ("YYYY-MM-DDTHH:mm:ss", or a bare
+ * date). Returns null for anything else, including strings with `Z` or an
+ * offset, which are instants rather than wall clocks.
+ */
+export function parseLocalDateTime(value: string): WallClock | null {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (!match) return null;
+  return {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+    hour: Number(match[4] || 0),
+    minute: Number(match[5] || 0),
+    second: Number(match[6] || 0),
+  };
 }
 
 // Constructing Intl.DateTimeFormat is expensive (ICU data lookup); cache one
@@ -126,6 +169,45 @@ export function getWallClock(date: Date, timeZone: string): WallClock {
   };
 }
 
+/**
+ * A JMAP LocalDateTime ("YYYY-MM-DDTHH:mm:ss") for a date-time string, as the
+ * wall clock in `timeZone` (UTC when unset). Strings that already carry no
+ * zone are returned as they are; one with `Z` or an offset is converted.
+ *
+ * CalendarEvent/query reads `after`/`before` as LocalDateTime in the request's
+ * timeZone, and Stalwart silently drops a `Z` or offset instead of honouring
+ * it, which shifted every UTC range by the user's offset.
+ */
+export function toLocalDateTime(value: string, timeZone?: string): string {
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)) return value;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const w = getWallClock(date, timeZone || "UTC");
+  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
+  return `${pad(w.year, 4)}-${pad(w.month)}-${pad(w.day)}T${pad(w.hour)}:${pad(w.minute)}:${pad(w.second)}`;
+}
+
+/**
+ * A LocalDateTime ("YYYY-MM-DDTHH:mm:ss") read as the wall clock in
+ * `fromZone`, as the wall clock in `toZone` at the same instant. Anything else
+ * (a value with `Z` or an offset, or one that does not parse) is returned as
+ * it is.
+ */
+export function moveLocalDateTime(value: string, fromZone: string, toZone: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/.exec(value);
+  if (!match || fromZone === toZone) return value;
+  const [year, month, day, hour, minute, second] = match.slice(1).map(Number);
+  const wall = new Date(0);
+  wall.setUTCFullYear(year, month - 1, day);
+  wall.setUTCHours(hour, minute, second, 0);
+  const asUtc = wall.getTime();
+  // Two offset lookups, as in fromZonedDisplayDate, for wall clocks next to a
+  // DST transition.
+  const guess = asUtc - getTimeZoneOffsetMs(new Date(asUtc), fromZone);
+  const instant = new Date(asUtc - getTimeZoneOffsetMs(new Date(guess), fromZone));
+  return toLocalDateTime(instant.toISOString(), toZone);
+}
+
 /** UTC offset of `timeZone` at the given instant, in milliseconds (east = positive). */
 export function getTimeZoneOffsetMs(date: Date, timeZone: string): number {
   const w = getWallClock(date, timeZone);
@@ -164,6 +246,20 @@ export function fromZonedDisplayDate(wall: Date, timeZone: string): Date {
     wall.getFullYear(), wall.getMonth(), wall.getDate(),
     wall.getHours(), wall.getMinutes(), wall.getSeconds(), wall.getMilliseconds(),
   );
+  const guess = asUtc - getTimeZoneOffsetMs(new Date(asUtc), timeZone);
+  return new Date(asUtc - getTimeZoneOffsetMs(new Date(guess), timeZone));
+}
+
+/**
+ * The instant at which the clock in `timeZone` reads `w`. Unlike
+ * fromZonedDisplayDate it never goes through a Date's local fields, so a
+ * time that the browser's own zone skips at a DST change is not shifted.
+ */
+export function fromWallClock(w: WallClock, timeZone: string): Date {
+  const d = new Date(0);
+  d.setUTCFullYear(w.year, w.month - 1, w.day);
+  d.setUTCHours(w.hour, w.minute, w.second, 0);
+  const asUtc = d.getTime();
   const guess = asUtc - getTimeZoneOffsetMs(new Date(asUtc), timeZone);
   return new Date(asUtc - getTimeZoneOffsetMs(new Date(guess), timeZone));
 }

@@ -1,8 +1,8 @@
 "use client";
 
-import { useRef, useState, type DragEvent } from "react";
+import { useRef, useState, type DragEvent, type KeyboardEvent } from "react";
 import { useTranslations } from "next-intl";
-import { Mail, Calendar, BookUser, HardDrive, Settings, PenSquare, MailOpen, Folder, X, type LucideIcon } from "lucide-react";
+import { Mail, Calendar, BookUser, HardDrive, Settings, PenSquare, MailOpen, Folder, Search, X, type AppIcon } from "@/components/icons";
 import { cn } from "@/lib/utils";
 import { useProTabStore, type ProTab, type ProTabKind, type ProPaneId } from "@/stores/pro-tab-store";
 import {
@@ -35,7 +35,7 @@ interface ProTabBarProps {
   className?: string;
 }
 
-const TAB_ICONS: Record<ProTabKind, LucideIcon> = {
+const TAB_ICONS: Record<ProTabKind, AppIcon> = {
   mail: Mail,
   calendar: Calendar,
   contacts: BookUser,
@@ -44,6 +44,7 @@ const TAB_ICONS: Record<ProTabKind, LucideIcon> = {
   compose: PenSquare,
   email: MailOpen,
   folder: Folder,
+  search: Search,
 };
 
 type DropIndicator = { targetId: string; edge: "before" | "after" } | null;
@@ -171,6 +172,34 @@ export function ProTabBar({
     handleDragEnd();
   };
 
+  // The keyboard: ← and → go to the previous or next tab, Alt+Shift+← / →
+  // move the tab itself (the order is otherwise drag-only, WCAG 2.1.1).
+  const handleTabKeyDown = (e: KeyboardEvent<HTMLDivElement>, tab: ProTab, index: number) => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onActivate(tab.id);
+      return;
+    }
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    if (e.ctrlKey || e.metaKey) return;
+    const rtl = getComputedStyle(e.currentTarget).direction === "rtl";
+    const step = (e.key === "ArrowRight") !== rtl ? 1 : -1;
+    const other = tabs[index + step];
+    if (!other) return;
+    e.preventDefault();
+    const strip = e.currentTarget.parentElement;
+    if (e.altKey && e.shiftKey) {
+      reorderTab(tab.id, other.id, step > 0 ? "after" : "before");
+      return;
+    }
+    if (e.altKey || e.shiftKey) return;
+    onActivate(other.id);
+    requestAnimationFrame(() => {
+      strip?.querySelector<HTMLElement>(`[data-tab-id="${CSS.escape(other.id)}"]`)?.focus();
+    });
+  };
+
   const handleStripEndDragOver = (e: DragEvent<HTMLDivElement>) => {
     const kind = dragKind(e);
     if (!kind) return;
@@ -199,7 +228,7 @@ export function ProTabBar({
       data-pane-strip={paneId}
       onDragLeave={handleStripDragLeave}
     >
-      {tabs.map((tab) => {
+      {tabs.map((tab, index) => {
         const Icon = TAB_ICONS[tab.kind];
         const isActive = tab.id === activeTabId;
         const isFocusedActive = isActive && isFocused;
@@ -211,6 +240,9 @@ export function ProTabBar({
             key={tab.id}
             role="tab"
             aria-selected={isActive}
+            tabIndex={isActive ? 0 : -1}
+            aria-keyshortcuts="Alt+Shift+ArrowLeft Alt+Shift+ArrowRight"
+            onKeyDown={(e) => handleTabKeyDown(e, tab, index)}
             data-tab-id={tab.id}
             data-pane-id={tab.paneId}
             draggable

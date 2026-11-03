@@ -1,16 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { JMAPClient } from '../jmap/client';
-import { batched, itemsPerRequest } from '../jmap/request-limits';
+import { batched, batchedBySize, itemsPerRequest } from '../jmap/request-limits';
 
 // Stalwart allows 16 method calls and 500 objects per request by default. A
 // batch built from a list the user controls - tags, a multi-select, an import -
 // reaches those ceilings with ordinary use, and going over fails the *whole*
 // request: nine tags used to blank every tag badge in the sidebar.
 
-function makeSession(core: Record<string, number> = {}) {
+function makeSession(core: Record<string, number> = {}, sharedAccounts = 0) {
+  const shared = Object.fromEntries(Array.from({ length: sharedAccounts }, (_, i) => [
+    `shared-${i}`, { name: `shared${i}@test.com`, isPersonal: false, accountCapabilities: {} },
+  ]));
   return {
     capabilities: { 'urn:ietf:params:jmap:core': core },
-    accounts: { 'acct-1': { name: 'test', isPersonal: true, accountCapabilities: {} } },
+    accounts: { 'acct-1': { name: 'test', isPersonal: true, accountCapabilities: {} }, ...shared },
     primaryAccounts: { 'urn:ietf:params:jmap:mail': 'acct-1' },
     apiUrl: 'https://mail.example.com/jmap/api',
     downloadUrl: 'https://mail.example.com/jmap/download/{accountId}/{blobId}/{name}',
@@ -53,6 +56,30 @@ describe('batched', () => {
   });
 });
 
+describe('batchedBySize', () => {
+  const size = (n: number) => n;
+
+  it('fills each batch up to the budget', () => {
+    expect(batchedBySize([3, 2, 2, 1, 4], size, 4, 10)).toEqual([[3], [2, 2], [1], [4]]);
+  });
+
+  it('gives an item over the budget a batch of its own', () => {
+    expect(batchedBySize([1, 9, 1], size, 4, 10)).toEqual([[1], [9], [1]]);
+  });
+
+  it('counts an item without a size as the whole budget', () => {
+    expect(batchedBySize(['a', 'b', 'c'], (item) => (item === 'b' ? undefined : 1), 4, 10)).toEqual([['a'], ['b'], ['c']]);
+  });
+
+  it('never puts more than maxCount items in a batch', () => {
+    expect(batchedBySize([1, 1, 1, 1, 1], size, 100, 2)).toEqual([[1, 1], [1, 1], [1]]);
+  });
+
+  it('returns nothing for an empty list', () => {
+    expect(batchedBySize([], size, 4, 10)).toEqual([]);
+  });
+});
+
 describe('itemsPerRequest', () => {
   it('divides the call budget by the cost of one item', () => {
     expect(itemsPerRequest(16, 2)).toBe(8);
@@ -78,8 +105,8 @@ describe('JMAPClient request limits', () => {
     vi.restoreAllMocks();
   });
 
-  async function connectedClient(core?: Record<string, number>): Promise<JMAPClient> {
-    fetchSpy.mockResolvedValueOnce(jsonResponse(makeSession(core)));
+  async function connectedClient(core?: Record<string, number>, sharedAccounts = 0): Promise<JMAPClient> {
+    fetchSpy.mockResolvedValueOnce(jsonResponse(makeSession(core, sharedAccounts)));
     const client = JMAPClient.withBearer('https://mail.example.com', 'token123', 'user@test.com');
     await client.connect();
     fetchSpy.mockReset();
@@ -96,6 +123,41 @@ describe('JMAPClient request limits', () => {
     }) as never);
     return sent;
   }
+
+  describe('getAllMailboxesWithState', () => {
+    // One Mailbox/get request per account, sent one after the other, made the
+    // folder tree of a user with 300 shared accounts take ~14 s (#1409).
+    it('packs the per-account Mailbox/get calls and runs the requests in parallel', async () => {
+      const client = await connectedClient({ maxCallsInRequest: 16, maxConcurrentRequests: 4 }, 40);
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const sent: Array<Array<[string, Record<string, unknown>, string]>> = [];
+      fetchSpy.mockImplementation((async (_url: string, init: RequestInit) => {
+        const { methodCalls } = JSON.parse(init.body as string) as { methodCalls: Array<[string, Record<string, unknown>, string]> };
+        sent.push(methodCalls);
+        maxInFlight = Math.max(maxInFlight, ++inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight--;
+        return jsonResponse({
+          methodResponses: methodCalls.map(([, args, id]) => args.accountId === 'shared-7'
+            ? ['error', { type: 'forbidden' }, id]
+            : ['Mailbox/get', { accountId: args.accountId, state: `s-${args.accountId}`, list: [{ id: 'inbox', name: 'Inbox', role: 'inbox' }] }, id]),
+        });
+      }) as never);
+
+      const { mailboxes, states } = await client.getAllMailboxesWithState();
+
+      expect(sent.map((calls) => calls.length)).toEqual([16, 16, 9]);
+      expect(maxInFlight).toBe(2);
+      // Session order, without the account whose call failed.
+      const expected = ['acct-1', ...Array.from({ length: 40 }, (_, i) => `shared-${i}`)].filter((id) => id !== 'shared-7');
+      expect(mailboxes.map((m) => m.accountId)).toEqual(expected);
+      expect(mailboxes[0].id).toBe('inbox');
+      expect(mailboxes[1].id).toBe('shared-0:inbox');
+      expect(Object.keys(states)).toEqual(expect.arrayContaining(expected));
+      expect(states['shared-7']).toBeUndefined();
+    });
+  });
 
   describe('getTagCounts', () => {
     // Two Email/query calls per tag: nine tags is 18 calls against a ceiling of 16.
@@ -147,6 +209,27 @@ describe('JMAPClient request limits', () => {
 
       expect(sent.map(calls => calls.length)).toEqual([4, 4, 4, 4, 2]);
     });
+
+    it('leaves the excluded folders out of both counts (#1156)', async () => {
+      const client = await connectedClient({ maxCallsInRequest: 16 });
+      const sent = recordRequests((methodCalls) => ({
+        methodResponses: methodCalls.map(([, , callId]) => ['Email/query', { total: 0 }, callId]),
+      }));
+
+      await client.getTagCounts(['work'], undefined, ['trash', 'junk']);
+
+      const [total, unread] = sent[0].map(([, args]) => (args as { filter: unknown }).filter);
+      expect(total).toEqual({
+        operator: 'AND',
+        conditions: [{ hasKeyword: '$label:work' }, { inMailboxOtherThan: ['trash', 'junk'] }],
+      });
+      expect(unread).toEqual({
+        operator: 'AND',
+        conditions: [
+          { hasKeyword: '$label:work' }, { notKeyword: '$seen' }, { inMailboxOtherThan: ['trash', 'junk'] },
+        ],
+      });
+    });
   });
 
   describe('getCategoryUnreadCounts', () => {
@@ -170,7 +253,7 @@ describe('JMAPClient request limits', () => {
 
     it('splits batchDeleteEmails at maxObjectsInSet', async () => {
       const client = await connectedClient({ maxObjectsInSet: 500 });
-      const sent = recordRequests(() => ({ methodResponses: [['Email/set', { destroyed: [] }, '0']] }));
+      const sent = recordRequests(calls => ({ methodResponses: [['Email/set', { destroyed: calls[0][1].destroy }, '0']] }));
 
       await client.batchDeleteEmails(ids);
 

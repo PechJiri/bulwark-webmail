@@ -13,8 +13,12 @@ vi.mock('@/lib/logger', () => ({
   logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn(), info: vi.fn() },
 }));
 
+vi.mock('@/lib/security/same-origin', () => ({ rejectCrossOriginRequest: () => null }));
+vi.mock('@/lib/auth/session-age', () => ({ writeSignInStamp: vi.fn() }));
+
 vi.mock('@/lib/oauth/cookie-config', () => ({
   getCookieOptions: () => ({ httpOnly: true, secure: true, sameSite: 'lax', path: '/' }),
+  getSignInCookieOptions: () => ({ httpOnly: true, secure: true, sameSite: 'lax', path: '/' }),
 }));
 
 const decryptPayload = vi.fn();
@@ -71,12 +75,13 @@ describe('server-side SSO completion', () => {
     const { POST } = await import('@/app/api/auth/sso/complete/route');
     const request = {
       json: async () => ({ code: 'authorization-code', state: 'expected-state', slot: 0 }),
+      nextUrl: { basePath: '' },
     } as Parameters<typeof POST>[0];
 
     const response = await POST(request);
 
     expect(response.status).toBe(200);
-    expect(cookieStore.get('jmap_it')?.value).toBe('signed-keycloak-id-token');
+    expect(cookieStore.get('jmap_idt')?.value).toBe('signed-keycloak-id-token');
   });
 
   it('identifies a missing transaction for fresh login without exchanging its code', async () => {
@@ -84,6 +89,7 @@ describe('server-side SSO completion', () => {
     const { POST } = await import('@/app/api/auth/sso/complete/route');
     const response = await POST({
       json: async () => ({ code: 'old-code', state: 'expected-state' }),
+      nextUrl: { basePath: '' },
     } as Parameters<typeof POST>[0]);
 
     expect(response.status).toBe(400);
@@ -97,6 +103,7 @@ describe('server-side SSO completion', () => {
     const { POST } = await import('@/app/api/auth/sso/complete/route');
     const response = await POST({
       json: async () => ({ code: 'old-code', state: 'expected-state' }),
+      nextUrl: { basePath: '' },
     } as Parameters<typeof POST>[0]);
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ error_code: 'sso_session_expired' });
@@ -108,6 +115,7 @@ describe('server-side SSO completion', () => {
     const { POST } = await import('@/app/api/auth/sso/complete/route');
     const response = await POST({
       json: async () => ({ code: 'old-code', state: 'wrong-state' }),
+      nextUrl: { basePath: '' },
     } as Parameters<typeof POST>[0]);
     expect(response.status).toBe(400);
     expect((await response.json()).error_code).toBeUndefined();

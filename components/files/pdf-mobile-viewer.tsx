@@ -2,8 +2,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useTranslations } from "next-intl";
-import { Loader2, ExternalLink } from "lucide-react";
+import { Loader2, ExternalLink } from "@/components/icons";
 import { Button } from "@/components/ui/button";
+import { liteMountedAssetUrl } from "@/lib/lite";
+import { canOpenUrlInNewWindow } from "@/lib/standalone-display";
 
 // Real inline PDF preview for mobile browsers. Android Chrome / iOS WebKit have
 // no native inline PDF viewer, so the desktop <iframe src=blob:> approach
@@ -31,7 +33,7 @@ const DOUBLE_TAP_SLOP = 30; // px
 // used for the open-in-new-tab fallback. pdf.js must be fed the bytes, not the
 // URL: fetching a blob: URL is governed by CSP connect-src, which doesn't (and
 // shouldn't need to) allow blob:, so getDocument({ url }) is blocked (#871).
-export function PdfMobileViewer({ url, blob }: { url: string; blob: Blob }) {
+export function PdfMobileViewer({ url, blob, allowNewTab = true }: { url: string; blob: Blob; /** False under a device policy without downloads. */ allowNewTab?: boolean }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const pagesRef = useRef<HTMLDivElement>(null);
   const zoom = useRef({ step: 0, scale: 1 });
@@ -50,10 +52,10 @@ export function PdfMobileViewer({ url, blob }: { url: string; blob: Blob }) {
     (async () => {
       try {
         const pdfjs = await import("pdfjs-dist");
-        pdfjs.GlobalWorkerOptions.workerSrc = new URL(
+        pdfjs.GlobalWorkerOptions.workerSrc = liteMountedAssetUrl(new URL(
           "pdfjs-dist/build/pdf.worker.min.mjs",
           import.meta.url,
-        ).toString();
+        ).toString());
 
         // The Uint8Array is created fresh from the blob, so pdf.js taking
         // ownership of (and transferring) the buffer is fine.
@@ -215,15 +217,21 @@ export function PdfMobileViewer({ url, blob }: { url: string; blob: Blob }) {
       {status === "error" && (
         // pdf.js couldn't render this document (corrupt/encrypted, worker load
         // failure, ...). Offer the OS/native viewer instead of a stuck frame.
+        // An installed app cannot open the blob: URL in a new window (#865),
+        // so it only says so; the header's download button still works.
         <div className="flex justify-center py-10">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => window.open(url, "_blank", "noopener,noreferrer")}
-          >
-            <ExternalLink className="w-4 h-4 me-2" />
-            {t("open_in_new_tab")}
-          </Button>
+          {allowNewTab && canOpenUrlInNewWindow(url) ? (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => window.open(url, "_blank", "noopener,noreferrer")}
+            >
+              <ExternalLink className="w-4 h-4 me-2" />
+              {t("open_in_new_tab")}
+            </Button>
+          ) : (
+            <p className="text-sm text-destructive">{t("preview_error")}</p>
+          )}
         </div>
       )}
       <div ref={pagesRef} className="w-full" />
