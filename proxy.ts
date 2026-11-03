@@ -290,18 +290,9 @@ export async function proxy(request: NextRequest) {
   const loginLocale = (routing.locales as readonly string[]).find(
     (locale) => pathname === `${request.nextUrl.basePath}/${locale}/login` || pathname === `/${locale}/login`,
   );
-  if (loginLocale && request.cookies.get('bulwark_signed_out')?.value === '1') {
-    const response = NextResponse.next();
-    response.cookies.set('bulwark_signed_out', '', {
-      httpOnly: true,
-      secure: request.nextUrl.protocol === 'https:',
-      sameSite: 'lax',
-      path: '/',
-      maxAge: 0,
-    });
-    return response;
-  }
+  const signedOutMarker = loginLocale !== undefined && request.cookies.get('bulwark_signed_out')?.value === '1';
   const shouldAutoStartSso =
+    !signedOutMarker &&
     loginLocale !== undefined &&
     configManager.get<boolean>("oauthEnabled", false) &&
     configManager.get<boolean>("oauthOnly", false) &&
@@ -314,7 +305,9 @@ export async function proxy(request: NextRequest) {
 
   if (shouldAutoStartSso) {
     const url = request.nextUrl.clone();
-    url.pathname = `${request.nextUrl.basePath}/api/auth/sso/start`;
+    // NextURL serializes basePath separately, so pathname must stay relative
+    // to it or sub-path installs receive the prefix twice.
+    url.pathname = "/api/auth/sso/start";
     url.search = "";
     url.searchParams.set("locale", loginLocale);
     url.searchParams.set("return", "redirect");
@@ -538,6 +531,16 @@ export async function proxy(request: NextRequest) {
     "camera=(), microphone=(), geolocation=(), payment=()"
   );
   response.headers.set("Content-Security-Policy", csp);
+
+  if (signedOutMarker) {
+    response.cookies.set('bulwark_signed_out', '', {
+      httpOnly: true,
+      secure: request.nextUrl.protocol === 'https:',
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 0,
+    });
+  }
 
   return response;
 }

@@ -2051,7 +2051,13 @@ export const useAuthStore = create<AuthState>()(
 
           if (!ssoRes.ok) {
             const errorData = await ssoRes.json().catch(() => ({ error: 'token_exchange_failed' }));
-            throw new Error(errorData.error || 'token_exchange_failed');
+            const errorCode = errorData && typeof errorData.error_code === 'string'
+              ? errorData.error_code
+              : '';
+            const safeErrorCode = errorCode === 'sso_session_missing' || errorCode === 'sso_session_expired'
+              ? errorCode
+              : 'token_exchange_failed';
+            throw new Error(safeErrorCode);
           }
 
           // `remember` is what the login page chose when the flow started.

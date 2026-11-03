@@ -35,6 +35,8 @@ it('starts fresh browser login instead of retrying a callback with no pending SS
   render(<OAuthCallbackPage />);
   await waitFor(() => expect(mocks.replaceLocation).toHaveBeenCalledWith('/cs/login'));
   expect(mocks.login).toHaveBeenCalledTimes(1);
+  expect(mocks.replaceLocation).toHaveBeenCalledTimes(1);
+  expect(sessionStorage.getItem('sso_recovery_attempted')).toBe('1');
   expect(mocks.push).not.toHaveBeenCalled();
 });
 
@@ -81,6 +83,9 @@ it('recovers an expired transaction through the mount-prefixed login path', asyn
   window.history.replaceState({}, '', '/webmail/cs/auth/callback');
   render(<OAuthCallbackPage />);
   await waitFor(() => expect(mocks.replaceLocation).toHaveBeenCalledWith('/webmail/cs/login'));
+  expect(mocks.login).toHaveBeenCalledTimes(1);
+  expect(mocks.replaceLocation).toHaveBeenCalledTimes(1);
+  expect(sessionStorage.getItem('sso_recovery_attempted')).toBe('1');
 });
 
 it('keeps the error screen if the loop guard cannot be persisted', async () => {

@@ -42,6 +42,19 @@ describe('proxy automatic SSO entrypoint', () => {
       .toBe('https://webmail.example.com/api/auth/sso/start?locale=cs&return=redirect');
   });
 
+  it('adds the mount prefix exactly once for a sub-path install', async () => {
+    const request = new NextRequest('https://webmail.example.com/webmail/cs/login', {
+      nextConfig: { basePath: '/webmail' },
+    });
+    const response = await proxy(request);
+
+    expect(response.status).toBe(307);
+    const location = new URL(response.headers.get('location')!);
+    expect(location.pathname).toBe('/webmail/api/auth/sso/start');
+    expect(location.searchParams.get('locale')).toBe('cs');
+    expect(location.searchParams.get('return')).toBe('redirect');
+  });
+
   it.each([
     '?logged_out=1',
     '?sso_error=failed',
@@ -63,5 +76,10 @@ describe('proxy automatic SSO entrypoint', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('location')).toBeNull();
     expect(response.cookies.get('bulwark_signed_out')?.maxAge).toBe(0);
+    expect(response.headers.get('x-middleware-request-x-nonce')).toBeTruthy();
+    expect(response.headers.get('Content-Security-Policy')).toContain('frame-ancestors');
+    expect(response.headers.get('X-Frame-Options')).toBe('SAMEORIGIN');
+    expect(response.headers.get('Referrer-Policy')).toBe('strict-origin-when-cross-origin');
+    expect(response.headers.get('Strict-Transport-Security')).toBe('max-age=63072000');
   });
 });

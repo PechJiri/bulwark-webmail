@@ -82,4 +82,17 @@ describe('GET /api/auth/sso/start', () => {
     expect(location.searchParams.get('redirect_uri'))
       .toBe('https://webmail.pechovic.cz/cs/auth/callback');
   });
+
+  it('includes the configured mount prefix once in the localized callback', async () => {
+    const request = new NextRequest(
+      'https://webmail.example.com/webmail/api/auth/sso/start?locale=cs&return=redirect',
+      { nextConfig: { basePath: '/webmail' } },
+    );
+    const response = await GET(request);
+
+    expect(response.status).toBe(307);
+    const location = new URL(response.headers.get('location')!);
+    expect(location.searchParams.get('redirect_uri'))
+      .toBe('https://webmail.example.com/webmail/cs/auth/callback');
+  });
 });
