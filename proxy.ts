@@ -1,22 +1,97 @@
-import { type NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import createIntlMiddleware from "next-intl/middleware";
 import { routing } from "./i18n/routing";
+import { localeFromAcceptLanguage } from "./i18n/locale-matcher";
+import { isSameOriginRequest } from "./lib/security/same-origin";
 import { getEnabledPluginFrameOrigins } from "./lib/admin/csp-frame-origins";
 import {
-  APP_FRAME_ORIGINS_COOKIE,
+  inlineAppFrameOrigins,
   parseAppFrameOrigins,
+  pickAppFrameOriginsCookie,
 } from "./lib/security/app-frame-origins";
 import { configManager } from "./lib/admin/config-manager";
 import { parseJmapServers } from "./lib/admin/jmap-servers";
+import { isNoThirdPartyTrafficOn } from "./lib/admin/third-party-mode";
+import { listReachableHosts, noThirdPartyCspSources } from "./lib/admin/reachable-hosts";
+import { getWopiEditorOrigins } from "./lib/wopi/discovery";
 import { detectSetupState } from "./lib/setup/state";
+import { isServedOverHttps } from "./lib/security/request-protocol";
+import { bootGateResponse } from "./lib/shared-store/boot-gate";
 
 const intlMiddleware = createIntlMiddleware(routing);
 
-// Next 16's Proxy always runs on Node.js runtime and route-segment config
-// (e.g. `export const config = { matcher }`) is no longer allowed in the
-// proxy file. We replicate the previous matcher inline by short-circuiting
-// requests for API routes, Next internals and static assets.
-const PROXY_SKIP_PATTERN = /^\/(?:api|_next)(?:\/|$)|\.[^/]+$/;
+/**
+ * next-intl uses best-fit locale matching, which can rank `zh` ahead of
+ * `zh-TW` for regional Traditional Chinese tags such as `zh-HK`. Collapse a
+ * Chinese Accept-Language list to the exact locale selected by Bulwark's
+ * script/region-aware matcher before handing the request to next-intl. URL
+ * prefixes and the NEXT_LOCALE cookie still keep their higher precedence.
+ */
+function withMatchedChineseAcceptLanguage(request: NextRequest): NextRequest {
+  const localeCookie = routing.localeCookie;
+  const localeCookieName =
+    localeCookie === false
+      ? null
+      : typeof localeCookie === "object" && localeCookie.name
+        ? localeCookie.name
+        : "NEXT_LOCALE";
+  const cookieLocale = localeCookieName ? request.cookies.get(localeCookieName)?.value : undefined;
+  if (cookieLocale && (routing.locales as readonly string[]).includes(cookieLocale)) return request;
+
+  const acceptLanguage = request.headers.get("accept-language");
+  const locale = localeFromAcceptLanguage(acceptLanguage, routing.locales);
+  if (locale !== "zh" && locale !== "zh-TW") return request;
+  if (acceptLanguage === locale) return request; // nothing to collapse, keep the original request
+
+  const headers = new Headers(request.headers);
+  headers.set("accept-language", locale);
+  // A cloned NextRequest re-parses its URL, so `nextConfig` has to be handed
+  // over as well: without it the base path stays glued to nextUrl.pathname and
+  // next-intl rewrites a sub-path install to /zh-TW/<basePath>/... (a 404)
+  // instead of /<basePath>/zh-TW/....
+  const basePath = request.nextUrl.basePath;
+  return new NextRequest(request, { headers, nextConfig: basePath ? { basePath } : undefined });
+}
+
+// Next 16's Proxy always runs on Node.js runtime (a `runtime` in the config
+// below is refused). The matcher only leaves out the upload routes; API
+// routes, Next internals and static assets still pass through here and are
+// short-circuited inline after the setup and CSRF gates.
+const PROXY_SKIP_PATTERN = /^\/(?:api|_next)(?:\/|$)/;
+
+/**
+ * Routes the proxy does not run for: the ones that take uploads over 10 MB.
+ * For every request it runs for, Next first copies the body for it, up to
+ * proxyClientMaxBodySize (10 MB) and silently cutting off the rest; raising
+ * that limit made any unauthenticated POST hold up to it in memory. These
+ * handlers gate cross-origin requests themselves (the WOPI file routes are
+ * token-authed) and cap what they read. Next tests the raw and the decoded
+ * path; the proxy is skipped only when both are one of these exactly.
+ * next.config.ts gives them the headers the proxy would have set.
+ * A literal: Next reads it at build time.
+ *
+ * The bare "/" entry is for sub-path installs: Next glues the base path in
+ * front of each source, so the second pattern only matches /webmail/... and
+ * never /webmail itself. That request then skipped the locale redirect and
+ * ended on a 404 (#1455).
+ */
+export const config = {
+  matcher: ["/", "/((?!api/webdav$|api/plugin-proxy$|api/wopi/files/[^/]+/contents$).*)"],
+};
+
+// What Next serves from public/: a single dotted segment at the root
+// (/sw.js, /favicon.ico, /manifest.webmanifest) and the branding/,
+// notification/, demo/ and plugin-sandbox-assets/ asset folders. The upstream matcher treated EVERY path whose
+// last segment has a dot as a static file, but the [[...segments]] catch-alls
+// under /<locale>/mail, /calendar, /contacts and /files make
+// /en/mail/folder/inbox/statement.pdf a real signed-in page, and it rendered
+// without a CSP or any other security header (GHSA-xvjh-v9c6-qcvc). Only what
+// is genuinely static may skip locale routing and the headers.
+const STATIC_ASSET_PATTERN = /^\/[^/]+\.[^/]+$|^\/(?:branding|notification|demo|plugin-sandbox-assets)\//;
+
+export function isStaticAssetPath(pathname: string): boolean {
+  return STATIC_ASSET_PATTERN.test(pathname);
+}
 
 /**
  * Hand the route every request header the client sent, plus `extra`.
@@ -28,7 +103,7 @@ const PROXY_SKIP_PATTERN = /^\/(?:api|_next)(?:\/|$)|\.[^/]+$/;
  * Next-Url, Cookie, Accept-Language, ... from every page request that skips
  * the intl middleware: all locale-prefixed paths - i.e. every page of a
  * NEXT_PUBLIC_LOCALE_PREFIX=always (Docker) build - plus /admin, /protocol,
- * /setup and the plugin sandbox. Since Next 16.3 the server recomputes the
+ * /setup, /connector and the plugin sandbox. Since Next 16.3 the server recomputes the
  * `_rsc` cache-busting hash from those router headers
  * (experimental.validateRSCRequestHeaders, on by default) and answers a
  * mismatch with a 307 to the "expected" URL; the client re-requests, the
@@ -66,6 +141,47 @@ function forwardRequestHeaders(
   return response;
 }
 
+/**
+ * The path Next routes on. `nextUrl.pathname` keeps percent-escapes, but the
+ * route matcher decodes them, so `/api/%61uth/session` reaches the
+ * `/api/auth/session` handler. Security decisions must use the decoded form
+ * or an escaped spelling walks around them.
+ */
+export function routePathOf(pathname: string): string {
+  try {
+    return decodeURIComponent(pathname);
+  } catch {
+    return pathname;
+  }
+}
+
+/**
+ * Paths under /api/ that must accept requests without a same-origin browser
+ * context: the office editor's WOPI host calls the file endpoints
+ * server-to-server with a token of its own, not the session cookie.
+ */
+function isOriginGateExempt(routePath: string): boolean {
+  return routePath.startsWith("/api/wopi/files/");
+}
+
+/**
+ * frame-ancestors for the mail UI. It always includes 'self': the PDF preview
+ * frames a blob: document, and Safari enforces the page's frame-ancestors on
+ * that document too, so without 'self' the preview stays blank (#1301).
+ * 'none' in ALLOWED_FRAME_ANCESTORS means "no other site" here. The value
+ * can be saved in the admin dashboard, so a source that would end the
+ * directive (`;`, `,`) or break the header is dropped rather than written
+ * into it.
+ */
+export function mailFrameAncestors(allowed: string | undefined): string {
+  const sources = (typeof allowed === "string" ? allowed : "").trim().split(/\s+/)
+    .filter((s) => s && s.toLowerCase() !== "'none'" && /^[!-~]+$/.test(s) && !/[;,]/.test(s));
+  if (!sources.some((s) => s.toLowerCase() === "'self'")) sources.unshift("'self'");
+  return sources.join(" ");
+}
+
+const PROBE_PATHS = new Set(["/api/health", "/api/health/live", "/api/health/ready", "/api/ready", "/api/metrics"]);
+
 function isSetupPath(pathname: string): boolean {
   return (
     pathname === "/setup" ||
@@ -74,12 +190,40 @@ function isSetupPath(pathname: string): boolean {
   );
 }
 
+/**
+ * A redirect to `pathname` (without the base path) on the origin of
+ * request.url. Not request.nextUrl: Next renames a 127.x or [::1] host there
+ * to "localhost", and with skipProxyUrlNormalize (next.config.ts) Next no
+ * longer turns that back into a relative Location. On HOSTNAME=127.0.0.1 the
+ * browser would be sent to https://localhost:3000/... (#1487).
+ */
+function redirectTo(request: NextRequest, pathname: string, search: string): NextResponse {
+  return NextResponse.redirect(new URL(`${request.nextUrl.basePath}${pathname}${search}`, request.url));
+}
+
 export async function proxy(request: NextRequest) {
+  // The probes answer without config or store, so a replica that is still
+  // starting (or lost its shared store) can say so (#1066). The metrics
+  // endpoint, too: a scrape shouldn't fail while a replica boots.
+  const probePath = routePathOf(request.nextUrl.pathname);
+  if (PROBE_PATHS.has(probePath)) {
+    const probe = NextResponse.next();
+    probe.headers.set("X-Content-Type-Options", "nosniff");
+    probe.headers.set("X-Frame-Options", "DENY");
+    return probe;
+  }
+  // With a shared store, nothing else is served until boot finished.
+  const notReady = bootGateResponse(probePath);
+  if (notReady) return notReady;
+
   // Resolve setup state before deciding what to skip. The first call after
   // boot triggers the config load; subsequent calls are in-memory.
   await configManager.ensureLoaded();
   const setupState = detectSetupState();
-  const pathname = request.nextUrl.pathname;
+  // Raw form for what is echoed back (x-pathname); decoded form for every
+  // decision about the request.
+  const rawPathname = request.nextUrl.pathname;
+  const pathname = routePathOf(rawPathname);
 
   if (setupState === "bootstrap") {
     // Wizard active. Redirect HTML pages to /setup; let asset/internal
@@ -93,7 +237,7 @@ export async function proxy(request: NextRequest) {
       // Public read endpoint - serves wizard-uploaded branding assets so
       // image previews work during the wizard. No auth on the GET route.
       pathname.startsWith("/api/admin/branding/") ||
-      /\.[^/]+$/.test(pathname);
+      isStaticAssetPath(pathname);
 
     if (!allowed) {
       if (pathname.startsWith("/api/")) {
@@ -102,10 +246,7 @@ export async function proxy(request: NextRequest) {
           { status: 503, headers: { "content-type": "application/json" } },
         );
       }
-      const url = request.nextUrl.clone();
-      url.pathname = "/setup";
-      url.search = request.nextUrl.search;
-      return NextResponse.redirect(url);
+      return redirectTo(request, "/setup", request.nextUrl.search);
     }
   } else if (isSetupPath(pathname)) {
     // Configured / env-managed: wizard is no longer reachable.
@@ -115,41 +256,68 @@ export async function proxy(request: NextRequest) {
     if (pathname.startsWith("/api/setup")) {
       return new NextResponse("Not Found", { status: 404 });
     }
-    const url = request.nextUrl.clone();
-    url.pathname = "/admin/login";
-    url.search = "";
-    return NextResponse.redirect(url);
+    return redirectTo(request, "/admin/login", "");
   }
 
-  if (PROXY_SKIP_PATTERN.test(pathname)) {
-    return NextResponse.next();
+  // Outer CSRF gate for every API route (GHSA-qvr9-m8cq-7wvg,
+  // GHSA-9mvj-98f5-9q6g). The identity cookies are SameSite=Lax, which a
+  // same-site sibling origin still receives, so any route that acts with
+  // them needs an origin check. The state-changing handlers check this
+  // themselves as well; this layer covers any route added later.
+  // GET/HEAD/OPTIONS pass through untouched.
+  if (pathname.startsWith("/api/") && !isOriginGateExempt(pathname) && !isSameOriginRequest(request)) {
+    return NextResponse.json({ error: "Cross-origin request rejected" }, { status: 403 });
   }
 
-  // Start automatic SSO at the server boundary. Doing this in the login
-  // page's client effect lets stale sessionStorage, an old service worker, or
-  // a failed hydration suppress the redirect and expose the intermediate
-  // Bulwark login page. Explicit error and account-management states must
-  // remain interactive so users are not trapped in a redirect loop.
+  if (PROXY_SKIP_PATTERN.test(pathname) || isStaticAssetPath(pathname)) {
+    // No page CSP here, but what comes back can still be a document: the
+    // not-found shell for a missing /foo.html or an unknown /api route. It
+    // must not be framed or sniffed into another type. API routes set their
+    // own CSP where they need one, so only non-API paths get frame-ancestors.
+    const skipped = NextResponse.next();
+    skipped.headers.set("X-Content-Type-Options", "nosniff");
+    skipped.headers.set("X-Frame-Options", "DENY");
+    if (!pathname.startsWith("/api/")) {
+      skipped.headers.set("Content-Security-Policy", "frame-ancestors 'none'");
+    }
+    return skipped;
+  }
+
+  // Start automatic SSO at the server boundary so stale sessionStorage or a
+  // failed client hydration cannot suppress the redirect. Keep the login
+  // page available for explicit sign-out, provider errors, account addition,
+  // mobile handoff and ambiguous multi-server installations.
   const loginLocale = (routing.locales as readonly string[]).find(
-    (locale) => pathname === `/${locale}/login`,
+    (locale) => pathname === `${request.nextUrl.basePath}/${locale}/login` || pathname === `/${locale}/login`,
   );
+  if (loginLocale && request.cookies.get('bulwark_signed_out')?.value === '1') {
+    const response = NextResponse.next();
+    response.cookies.set('bulwark_signed_out', '', {
+      httpOnly: true,
+      secure: request.nextUrl.protocol === 'https:',
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 0,
+    });
+    return response;
+  }
   const shouldAutoStartSso =
     loginLocale !== undefined &&
-    configManager.get<boolean>('oauthEnabled', false) &&
-    configManager.get<boolean>('oauthOnly', false) &&
-    configManager.get<boolean>('autoSsoEnabled', false) &&
-    parseJmapServers(configManager.get<unknown>('jmapServers', [])).length <= 1 &&
-    request.nextUrl.searchParams.get('logged_out') !== '1' &&
-    !request.nextUrl.searchParams.has('sso_error') &&
-    request.nextUrl.searchParams.get('mode') !== 'add-account' &&
-    !request.nextUrl.searchParams.has('mobile_redirect_uri');
+    configManager.get<boolean>("oauthEnabled", false) &&
+    configManager.get<boolean>("oauthOnly", false) &&
+    configManager.get<boolean>("autoSsoEnabled", false) &&
+    parseJmapServers(configManager.get<unknown>("jmapServers", [])).length <= 1 &&
+    request.nextUrl.searchParams.get("logged_out") !== "1" &&
+    !request.nextUrl.searchParams.has("sso_error") &&
+    request.nextUrl.searchParams.get("mode") !== "add-account" &&
+    !request.nextUrl.searchParams.has("mobile_redirect_uri");
 
   if (shouldAutoStartSso) {
     const url = request.nextUrl.clone();
-    url.pathname = '/api/auth/sso/start';
-    url.search = '';
-    url.searchParams.set('locale', loginLocale);
-    url.searchParams.set('return', 'redirect');
+    url.pathname = `${request.nextUrl.basePath}/api/auth/sso/start`;
+    url.search = "";
+    url.searchParams.set("locale", loginLocale);
+    url.searchParams.set("return", "redirect");
     return NextResponse.redirect(url);
   }
 
@@ -168,35 +336,106 @@ export async function proxy(request: NextRequest) {
     pathname === "/plugin-sandbox-privileged" ||
     pathname.startsWith("/plugin-sandbox-privileged/");
 
+  // The sandbox routes are only ever loaded as iframes by the host bridge.
+  // Refuse them as a top-level document (window.open() from another site, a
+  // typed URL): the browser sets `Sec-Fetch-Dest` and page script cannot
+  // forge it; browsers without it fall through to the runtime's own host gate.
+  // They also disappear entirely while the plugin feature is off, so a stock
+  // install never serves a document carrying 'unsafe-eval'
+  // (GHSA-96cx-gx36-3g79). Other destinations pass - `iframe` for the bridge,
+  // `empty` for the router's own RSC refetches - and cross-site framing is
+  // already blocked by the `frame-ancestors 'self'` below.
+  if (isSandboxPath) {
+    const pluginsEnabled = configManager.getPolicy().features?.pluginsEnabled === true;
+    if (!pluginsEnabled || request.headers.get("sec-fetch-dest") === "document") {
+      return new NextResponse("The plugin sandbox is only served inside the webmail.", {
+        status: 403,
+        headers: { "content-type": "text/plain" },
+      });
+    }
+  }
+
   const scriptSrc = isSandboxPath
     ? `'self' 'nonce-${nonce}' 'unsafe-eval'`
     : isDev
     ? `'self' 'nonce-${nonce}' 'unsafe-eval'`
     : `'self' 'nonce-${nonce}'`;
 
-  const connectSrc = isDev ? `'self' http: https: ws: wss:` : `'self' https:`;
+  // A plugin reaches the network only through api.http.fetch, which the host
+  // checks against the manifest's httpOrigins (H-03). The sandbox document
+  // itself gets its own origin and nothing else, so fetch(), images, fonts
+  // and CSS url() can't carry data to a host the manifest didn't name. Its
+  // own origin stays because the router refetches the page as RSC.
+  //
+  // With no third-party traffic (#903) the page itself gets the same kind of
+  // fence: its own origin plus the hosts the deployment configured (JMAP
+  // servers, OAuth issuer, relays, a self-hosted directory, sidebar apps,
+  // WOPI, LibreTranslate, branding images). It catches whatever the in-app
+  // switches miss, privileged plugins and plugin avatar URLs included.
+  const noThirdParty = !isSandboxPath && await isNoThirdPartyTrafficOn();
+  const ownHosts = noThirdParty
+    ? noThirdPartyCspSources(
+        listReachableHosts({ get: (key) => configManager.get(key), policy: configManager.getPolicy(), env: process.env }),
+        configManager.get<boolean>("allowCustomJmapEndpoint", false) === true,
+      )
+    : null;
+  const own = (sources: string[]) => (sources.length > 0 ? ` ${sources.join(" ")}` : "");
+  const connectSrc = isSandboxPath
+    ? `'self'`
+    : ownHosts ? `'self'${own(ownHosts.connect)}`
+    : isDev ? `'self' http: https: ws: wss:` : `'self' https:`;
+  const imgSrc = isSandboxPath ? `'self' data: blob:`
+    : ownHosts ? `'self' data: blob:${own(ownHosts.other)}` : `'self' data: blob: https:`;
+  const fontSrc = isSandboxPath ? `'self' data:`
+    : ownHosts ? `'self' data:${own(ownHosts.other)}` : `'self' https: data:`;
+  const mediaSrc = ownHosts ? `'self' blob:${own(ownHosts.other)}` : `'self' blob:`;
 
+  // The admin dashboard and the setup wizard are never framed. The embedding
+  // allowance is for the mail UI a portal wraps; a framed admin page is a
+  // clickjacking target with nothing to gain from being embedded.
+  const isAdminOrSetupPath = /^\/(?:admin|setup)(?:\/|$)/.test(pathname);
   const frameAncestors = isSandboxPath
     ? `'self'`
-    : process.env.ALLOWED_FRAME_ANCESTORS?.trim() || "'none'";
+    : isAdminOrSetupPath
+    ? "'none'"
+    : mailFrameAncestors(configManager.get<string>("allowedFrameAncestors", ""));
 
   // Plugins may declare iframe origins they need (e.g. for embedded video).
-  // Each origin is validated at install time and re-validated here.
-  const pluginFrameOrigins = await getEnabledPluginFrameOrigins();
+  // Each origin is validated at install time and re-validated here. None
+  // while the admin has plugins turned off: no plugin runs then.
+  const pluginFrameOrigins = configManager.getPolicy().features?.pluginsEnabled === true
+    ? await getEnabledPluginFrameOrigins()
+    : [];
 
   // Sidebar Apps set to open "inline" are a per-user setting the proxy can't
   // read, so the client mirrors their origins into a cookie (#787). Ignored
   // when the admin has turned the feature off, so a stale cookie can't keep
   // widening the CSP after the fact.
-  const sidebarAppsEnabled =
-    configManager.getPolicy().features?.sidebarAppsEnabled !== false;
+  const policy = configManager.getPolicy();
+  const sidebarAppsEnabled = policy.features?.sidebarAppsEnabled !== false;
   const appFrameOrigins = sidebarAppsEnabled
-    ? parseAppFrameOrigins(request.cookies.get(APP_FRAME_ORIGINS_COOKIE)?.value)
+    ? parseAppFrameOrigins(pickAppFrameOriginsCookie(
+        (name) => request.cookies.get(name)?.value,
+        isServedOverHttps(request),
+      ))
     : [];
+
+  // Apps the operator pins for everyone (#931) are known server-side, so their
+  // origins go straight into the header - no cookie handshake, and no reload
+  // the first time a user opens one. They survive the gate above, which only
+  // governs the apps users add themselves.
+  const managedAppFrameOrigins = inlineAppFrameOrigins(policy.defaultSidebarApps);
+
+  // WOPI document editor (#425): the editor is launched by POSTing the access
+  // token into an iframe on its origin, so that origin must be allowed in both
+  // frame-src AND form-action (which is otherwise 'self'). The browser loads
+  // it from the origins the editor's discovery names, which are not that of
+  // wopiClientUrl when discovery is fetched over an internal address (#1130).
+  const wopiOrigins = await getWopiEditorOrigins();
 
   const frameOrigins: string[] = [];
   const seenFrameOrigins = new Set<string>();
-  for (const origin of [...pluginFrameOrigins, ...appFrameOrigins]) {
+  for (const origin of [...pluginFrameOrigins, ...managedAppFrameOrigins, ...appFrameOrigins, ...wopiOrigins, ...(ownHosts?.other ?? [])]) {
     const key = origin.toLowerCase();
     if (seenFrameOrigins.has(key)) continue;
     seenFrameOrigins.add(key);
@@ -212,21 +451,31 @@ export async function proxy(request: NextRequest) {
     `default-src 'self'`,
     `script-src ${scriptSrc}`,
     `style-src 'self' 'unsafe-inline'`,
-    `img-src 'self' data: blob: https:`,
-    `font-src 'self' https: data:`,
+    `img-src ${imgSrc}`,
+    `font-src ${fontSrc}`,
     `connect-src ${connectSrc}`,
     frameSrc,
     `object-src 'self' blob:`,
     `base-uri 'self'`,
-    `form-action 'self'`,
+    // Plugin frames may use <form> for its submit event (allow-forms), but a
+    // form must not post anywhere: that would be a way out past connect-src.
+    isSandboxPath ? `form-action 'none'` : `form-action ${["'self'", ...wopiOrigins].join(" ")}`,
     `frame-ancestors ${frameAncestors}`,
-    `media-src 'self' blob:`,
+    `media-src ${mediaSrc}`,
+    // A plugin frame may run work it has to stop at a deadline (send checks'
+    // admin patterns) in a worker made from a blob; it gets the frame's own
+    // connect-src, so it reaches nothing the frame can't.
+    ...(isSandboxPath ? [`worker-src 'self' blob:`] : []),
   ].join("; ");
 
   // Skip intl middleware for routes outside the localized app tree.
   const isAdminRoute = pathname === '/admin' || pathname.startsWith('/admin/');
   const isProtocolRoute = pathname === '/protocol' || pathname.startsWith('/protocol/');
   const isSetupRoute = pathname === '/setup' || pathname.startsWith('/setup/');
+  // Connector links (/connector/<target>) are published in docs and READMEs
+  // and must not carry a locale. Letting next-intl rewrite them to
+  // /en/connector/... 404s, which breaks every link already in the wild.
+  const isConnectorRoute = pathname === '/connector' || pathname.startsWith('/connector/');
   // The plugin sandbox lives in its own root layout under app/(sandbox)/ and
   // is not part of the localized tree. Letting next-intl rewrite the path to
   // /en/plugin-sandbox 404s, which kills the iframe and disables every plugin.
@@ -241,9 +490,16 @@ export async function proxy(request: NextRequest) {
   );
 
   let intlResponse: ReturnType<typeof intlMiddleware> | null = null;
-  if (!isAdminRoute && !isProtocolRoute && !isSetupRoute && !isSandboxRoute && !hasLocalePrefix) {
+  if (
+    !isAdminRoute &&
+    !isProtocolRoute &&
+    !isSetupRoute &&
+    !isSandboxRoute &&
+    !isConnectorRoute &&
+    !hasLocalePrefix
+  ) {
     try {
-      intlResponse = intlMiddleware(request);
+      intlResponse = intlMiddleware(withMatchedChineseAcceptLanguage(request));
     } catch (error) {
       console.error('Locale middleware error:', error);
     }
@@ -255,7 +511,7 @@ export async function proxy(request: NextRequest) {
   // so getLocale() can't resolve the active locale there and falls back to the
   // default - emitting <html lang="en"> on e.g. /de pages, which makes browsers
   // offer to "translate this page". The layout reads x-pathname to recover it.
-  forwardRequestHeaders(response, request, { "x-nonce": nonce, "x-pathname": pathname });
+  forwardRequestHeaders(response, request, { "x-nonce": nonce, "x-pathname": rawPathname });
 
   response.headers.set("X-Content-Type-Options", "nosniff");
 
@@ -263,10 +519,20 @@ export async function proxy(request: NextRequest) {
   // specifies explicit origins, we rely solely on the CSP header.
   if (frameAncestors === "'none'") {
     response.headers.set("X-Frame-Options", "DENY");
+  } else if (frameAncestors === "'self'") {
+    response.headers.set("X-Frame-Options", "SAMEORIGIN");
   }
 
   response.headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
   response.headers.set("X-XSS-Protection", "0");
+  // Only on a request that arrived over TLS (directly, via the reverse
+  // proxy's X-Forwarded-Proto, or as COOKIE_SECURE=true declares): a
+  // plain-http dev or LAN install must not be pinned to https by a header it
+  // cannot honour. No includeSubDomains, which would speak for the operator's
+  // other hosts.
+  if (isServedOverHttps(request)) {
+    response.headers.set("Strict-Transport-Security", "max-age=63072000");
+  }
   response.headers.set(
     "Permissions-Policy",
     "camera=(), microphone=(), geolocation=(), payment=()"

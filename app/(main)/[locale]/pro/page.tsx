@@ -12,10 +12,14 @@ import { useEmailStore } from "@/stores/email-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useDeviceDetection } from "@/hooks/use-media-query";
 import { EmbeddedContext } from "@/hooks/use-is-embedded";
+import { OrgAnnouncement } from "@/components/org/org-announcement";
 import { PaneSizeContext } from "@/hooks/use-pane-size";
 import { PaneIdContext, ProTabFocusContext } from "@/hooks/use-pane-context";
 import { useDeepLinkUrl } from "@/hooks/use-deep-link-url";
 import { appPath, buildMailPath } from "@/lib/deep-links";
+import { GlobalSearchPalette } from "@/components/global-search/global-search-palette";
+import { SearchTabBody } from "@/components/global-search/search-tab-body";
+import { useGlobalSearchStore } from "@/stores/global-search-store";
 import { ProTabBar } from "@/components/pro/pro-tab-bar";
 import {
   PRO_TAB_DRAG_MIME,
@@ -31,6 +35,9 @@ import {
 import { useProTabStore, type ProTab, type ProTabKind, type ProPaneId, type ProSplitSide } from "@/stores/pro-tab-store";
 import { cn } from "@/lib/utils";
 import { getPathPrefix } from "@/lib/browser-navigation";
+import { onOpenEmail, proEmailTabOpener } from "@/lib/plugin-sandbox/open-email";
+import { ProSkeleton } from "@/components/boot-skeleton/pro-skeleton";
+import { useSkeletonLabels } from "@/components/boot-skeleton/use-skeleton-labels";
 
 import { MailApp } from "@/components/mail/mail-app";
 import { CalendarApp } from "@/components/calendar/calendar-app";
@@ -61,6 +68,9 @@ function renderTabBody(tab: ProTab): React.ReactNode {
   }
   if (tab.kind === 'folder' && tab.folderData) {
     return <ProFolderTabBody tabId={tab.id} data={tab.folderData} />;
+  }
+  if (tab.kind === 'search' && tab.searchData) {
+    return <SearchTabBody tabId={tab.id} data={tab.searchData} />;
   }
   const Component = APP_TAB_COMPONENTS[tab.kind];
   return Component ? <Component /> : null;
@@ -181,6 +191,7 @@ function Pane({ paneId, tabs, activeTabId, loadedTabIds, onPaneFocus, isFocused 
 
 export default function ProHome() {
   const t = useTranslations();
+  const { label: skeletonLabel } = useSkeletonLabels();
   const { isMobile, isTablet, isDesktop } = useDeviceDetection();
 
   const [initialCheckDone, setInitialCheckDone] = useState(
@@ -298,14 +309,40 @@ export default function ProHome() {
         return data.accountId ? `${path}?account=${encodeURIComponent(data.accountId)}` : path;
       }
       case 'compose':
-        // A draft has no permalink - fall back to the shell's own route so
-        // the bar never shows a message the user is no longer looking at.
+      case 'search':
+        // Neither a draft nor a search-results tab has a permalink - fall
+        // back to the shell's own route so the bar never shows a message the
+        // user is no longer looking at.
         return appPath('/pro');
       default:
         return null;
     }
   }, [isAuthenticated, client, focusedActiveTab, selectedMailbox, selectedEmailId, mailboxes, accountMailboxes]);
   useDeepLinkUrl(reflectedPath);
+
+  // Global search shortcuts: Ctrl/⌘+K toggles the palette, Ctrl+Shift+F
+  // opens it (features doc §"Focus global search"). Window-level and keyed on
+  // event.code so they fire from inside inputs and on non-Latin layouts.
+  useEffect(() => {
+    const onSearchShortcut = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      if (event.code === 'KeyK' && !event.shiftKey) {
+        event.preventDefault();
+        useGlobalSearchStore.getState().togglePalette();
+      } else if (event.code === 'KeyF' && event.shiftKey) {
+        event.preventDefault();
+        useGlobalSearchStore.getState().openPalette();
+      }
+    };
+    window.addEventListener('keydown', onSearchShortcut);
+    return () => window.removeEventListener('keydown', onSearchShortcut);
+  }, []);
+
+  // A plugin opening a message (api.ui.openEmail) gets an email tab, as a
+  // message link does here: the mail tab stays mounted while hidden, so its
+  // reader is not one the user would see.
+  const loadingTitle = t('common.loading');
+  useEffect(() => onOpenEmail(proEmailTabOpener(loadingTitle)), [loadingTitle]);
 
   const handleRailNavigate = (itemId: 'mail' | 'calendar' | 'contacts' | 'files' | 'settings') => {
     openTab(itemId);
@@ -414,19 +451,13 @@ export default function ProHome() {
     }
   };
 
-  // Loading state (matches standard page exactly)
-  if (!initialCheckDone || authLoading || !isAuthenticated || !client) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-background">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-foreground mx-auto"></div>
-          <p className="mt-4 text-sm text-muted-foreground">{t("common.loading")}</p>
-        </div>
-      </div>
-    );
+  // Until the session is up: the same skeleton the server drew, so hydration
+  // matches and nothing moves. Below desktop width the effect above is about
+  // to send the visitor to the standard page; keep the skeleton up meanwhile
+  // rather than a blank page.
+  if (!initialCheckDone || authLoading || !isAuthenticated || !client || !isDesktop) {
+    return <ProSkeleton label={skeletonLabel} />;
   }
-
-  if (!isDesktop) return null;
 
   // Each pane renders as a column: its own tab strip directly above its
   // body, so a tab visibly belongs to the pane beneath it and clicking a
@@ -477,7 +508,10 @@ export default function ProHome() {
 
   return (
     <EmbeddedContext.Provider value={true}>
-      <div className="flex flex-col h-dvh bg-background overflow-hidden pt-[env(safe-area-inset-top)]">
+      {/* data-pro-shell: a page skeleton inside a pane draws its own frame, not the Pro one. */}
+      <div data-pro-shell="" className="flex flex-col h-dvh bg-background overflow-hidden pt-[env(safe-area-inset-top)]">
+        {/* Once for the whole shell: email and folder tabs have no app strip, and split panes would show it twice. */}
+        <OrgAnnouncement />
         <div className="flex flex-1 overflow-hidden">
           {/* Leftmost Navigation Rail - identical to the standard layout */}
           <div
@@ -496,6 +530,7 @@ export default function ProHome() {
               activeAppId={inlineApp?.id ?? null}
               onNavigate={handleRailNavigate}
               activeItemId={railActiveItemId}
+              onOpenSearch={() => useGlobalSearchStore.getState().openPalette()}
             />
           </div>
 
@@ -525,6 +560,8 @@ export default function ProHome() {
             </div>
           )}
         </div>
+
+        <GlobalSearchPalette />
 
         <KeyboardShortcutsModal
           isOpen={showShortcutsModal}

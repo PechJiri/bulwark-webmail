@@ -1,8 +1,9 @@
 "use client";
 
 import { useTranslations } from "next-intl";
-import { Calendar as CalendarIcon, CheckSquare, Layers } from "lucide-react";
+import { Calendar as CalendarIcon, CheckSquare, Layers } from "@/components/icons";
 import { cn } from "@/lib/utils";
+import { TermInfo } from "@/components/ui/term";
 import type { CalendarComponentType } from "@/lib/jmap/types";
 
 /**
@@ -66,7 +67,7 @@ export function CalendarKindPicker({
           </button>
         ))}
       </div>
-      <p className="text-xs text-muted-foreground mt-1">{t("kind_hint")}</p>
+      <p className="text-xs text-muted-foreground mt-1">{t("kind_hint")} <TermInfo id="caldav" /></p>
     </div>
   );
 }

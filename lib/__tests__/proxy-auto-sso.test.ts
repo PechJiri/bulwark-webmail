@@ -53,4 +53,15 @@ describe('proxy automatic SSO entrypoint', () => {
     expect(response.status).toBe(200);
     expect(response.headers.get('location')).toBeNull();
   });
+
+  it('consumes the short-lived server marker after provider logout', async () => {
+    const request = new NextRequest('https://webmail.example.com/cs/login', {
+      headers: { cookie: 'bulwark_signed_out=1' },
+    });
+    const response = await proxy(request);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('location')).toBeNull();
+    expect(response.cookies.get('bulwark_signed_out')?.maxAge).toBe(0);
+  });
 });

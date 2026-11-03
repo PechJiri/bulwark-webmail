@@ -12,6 +12,11 @@ import { DEFAULT_SEARCH_FILTERS } from '@/lib/jmap/search-utils';
 import { useIdentityStore } from '@/stores/identity-store';
 import { useVacationStore } from '@/stores/vacation-store';
 import { useFileStore } from '@/stores/file-store';
+import { useTaskStore } from '@/stores/task-store';
+import { clearContactPhotoCache } from '@/lib/contact-photo-cache';
+import { bumpStoreEpoch } from '@/lib/store-epoch';
+import { useAccountSecurityStore } from '@/stores/account-security-store';
+import type { IJMAPClient } from '@/lib/jmap/client-interface';
 
 // Minimal snapshot shapes - we only capture what we need
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -49,6 +54,13 @@ export function snapshotAccount(accountId: string): void {
       selectedMailbox: emailState.selectedMailbox,
       searchQuery: emailState.searchQuery,
       quota: emailState.quota ? { ...emailState.quota } : emailState.quota,
+      // The list is drawn sorted by listOrder, so the rows need the order they
+      // were fetched in: without it a restored "unread first" page showed by
+      // date and jumped when the refresh landed. The sync state lets that
+      // refresh ask only for what changed instead of re-reading the page.
+      listOrder: emailState.listOrder,
+      emailListSync: emailState.emailListSync,
+      threadEmailCounts: new Map(emailState.threadEmailCounts),
     },
     contact: {
       contacts: [...contactState.contacts],
@@ -59,6 +71,8 @@ export function snapshotAccount(accountId: string): void {
       calendars: [...calendarState.calendars],
       events: [...calendarState.events],
       selectedCalendarIds: [...calendarState.selectedCalendarIds],
+      calendarSelectionChosen: calendarState.calendarSelectionChosen,
+      knownCalendarIds: calendarState.knownCalendarIds,
       viewMode: calendarState.viewMode,
       supportsCalendar: calendarState.supportsCalendar,
     },
@@ -105,6 +119,9 @@ export function restoreAccount(accountId: string): boolean {
 
 /** Clear all stores (used before restoring a different account) */
 export function clearAllStores(): void {
+  // In-flight fetches of the outgoing account must not land in the stores
+  // the next account is about to fill.
+  bumpStoreEpoch();
   useEmailStore.setState({
     emails: [],
     mailboxes: [],
@@ -117,7 +134,7 @@ export function clearAllStores(): void {
     isPushConnected: false,
     lastPushUpdate: null,
     newEmailNotification: null,
-    selectedEmailIds: new Set<string>(),
+    selectedEmailKeys: new Set<string>(),
     hasMoreEmails: false,
     totalEmails: 0,
     expandedThreadIds: new Set<string>(),
@@ -125,14 +142,28 @@ export function clearAllStores(): void {
     isLoadingThread: null,
     selectedKeyword: null,
     tagCounts: {},
+    listOrder: [],
+    listHold: null,
+    emailListSync: null,
+    threadEmailCounts: new Map(),
     searchFilters: { ...DEFAULT_SEARCH_FILTERS },
     isAdvancedSearchOpen: false,
   });
   useIdentityStore.getState().clearIdentities();
   useContactStore.getState().clearContacts();
+  // Downloaded contact photos are object URLs keyed by blobId; revoke them
+  // with the contacts they belong to.
+  clearContactPhotoCache();
   useVacationStore.getState().clearState();
   useCalendarStore.getState().clearState();
+  // The task list is the account's too: left in place, the next account shows
+  // it until its own arrives, and a fetch still under way could put it back.
+  useTaskStore.getState().clearTasks();
   useFilterStore.getState().clearState();
+  // 2FA state, app passwords and API keys are the account's own: left in
+  // place, the page shows them for the next account and "Remove" sends
+  // their ids there.
+  useAccountSecurityStore.getState().clearState();
   // The Files drive is account-scoped like every store above, but unlike them
   // it lives in a global store that outlives the FilesApp component. If we
   // don't reset it here, the previous account's client + resources linger in
@@ -141,6 +172,33 @@ export function clearAllStores(): void {
   // from the mail view, then navigate to Files). Clearing centrally makes the
   // reset happen on every switch path, not just the one the component observes.
   useFileStore.getState().clearClient();
+}
+
+/**
+ * Drops what the mail list still shows of a login that was signed out while
+ * another one stays active: the login's folder, when the Pro sidebar had it
+ * open (`viewingAccountId`), for the active login's Inbox, and the login's
+ * rows of a list that mixes accounts. Without the login's client every
+ * action on those rows fell back to the active login's, where the same ids
+ * name other messages: deleting them deleted the active login's mail.
+ */
+export function forgetAccountRows(accountId: string, activeClient: IJMAPClient | null): void {
+  const state = useEmailStore.getState();
+  if (state.viewingAccountId === accountId) {
+    const inbox = state.mailboxes.find((m) => m.role === 'inbox' && !m.isShared);
+    state.selectAccountMailbox(null, inbox?.id ?? '');
+    useEmailStore.setState({ emails: [] });
+    if (activeClient && inbox) void useEmailStore.getState().fetchEmails(activeClient, inbox.id);
+    return;
+  }
+  const gone = (email: { sourceClientAccountId?: string } | null) => email?.sourceClientAccountId === accountId;
+  if (!state.emails.some(gone) && !gone(state.selectedEmail)) return;
+  useEmailStore.setState((s) => ({
+    emails: s.emails.filter((email) => !gone(email)),
+    selectedEmail: gone(s.selectedEmail) ? null : s.selectedEmail,
+    // emailKeyFor: "<login>/<account>:<id>".
+    selectedEmailKeys: new Set([...s.selectedEmailKeys].filter((key) => !key.startsWith(`${accountId}/`))),
+  }));
 }
 
 /** Evict cached state for one account */

@@ -4,6 +4,7 @@ export interface OAuthMetadata {
   token_endpoint: string;
   revocation_endpoint?: string;
   end_session_endpoint?: string;
+  scopes_supported?: string[];
 }
 
 // Validates that a discovered endpoint URL is safe to follow. Server-side
@@ -69,17 +70,42 @@ function rememberFailure(serverUrl: string): void {
 // could point token_endpoint at 169.254.169.254 or 127.0.0.1:* and turn the
 // downstream fetch() into an SSRF with response-body reflection. Server-side
 // callers must pass `validateEndpoint`.
-async function endpointsArePublic(
+// Returns the first endpoint the validator rejects, or null when all pass.
+async function findRejectedEndpoint(
   endpoints: Array<string | undefined>,
   validate: EndpointValidator | undefined,
-): Promise<boolean> {
-  if (!validate) return true;
+): Promise<string | null> {
+  if (!validate) return null;
   for (const endpoint of endpoints) {
     if (endpoint === undefined) continue;
-    if (typeof endpoint !== 'string') return false;
-    if (!(await validate(endpoint))) return false;
+    if (typeof endpoint !== 'string') return String(endpoint);
+    if (!(await validate(endpoint))) return endpoint;
   }
-  return true;
+  return null;
+}
+
+/**
+ * Fetch a well-known document without following redirects anywhere: the
+ * endpoints inside it are validated, but the document itself was fetched
+ * with `fetch`'s default `follow`, so a configured host that answered with a
+ * redirect had the metadata read from wherever it pointed. One hop is
+ * followed when it stays on the same host (an http -> https upgrade or a
+ * path change); anything else is an error.
+ */
+async function fetchDiscoveryDocument(url: string): Promise<Response> {
+  const first = await fetch(url, { signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS), redirect: 'manual' });
+  const status = typeof first.status === 'number' ? first.status : 200;
+  if (status < 300 || status >= 400) return first;
+  const location = first.headers.get('location');
+  if (!location) throw new Error(`${url} redirected without a Location header`);
+  const next = new URL(location, url);
+  const from = new URL(url);
+  const sameHost = next.hostname === from.hostname;
+  const noDowngrade = next.protocol === 'https:' || next.protocol === from.protocol;
+  if (!sameHost || !noDowngrade) {
+    throw new Error(`${url} redirects to ${next.origin}, which is another host`);
+  }
+  return fetch(next.toString(), { signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS), redirect: 'error' });
 }
 
 // One pass over the well-known documents. Returns usable metadata, or null
@@ -93,7 +119,7 @@ async function attemptDiscovery(
 ): Promise<OAuthMetadata | null> {
   for (const url of urls) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(DISCOVERY_TIMEOUT_MS) });
+      const response = await fetchDiscoveryDocument(url);
       if (!response.ok) {
         errors.push(`${url} returned HTTP ${response.status}`);
         continue;
@@ -101,14 +127,19 @@ async function attemptDiscovery(
 
       const data = await response.json();
       if (data.authorization_endpoint && data.token_endpoint) {
-        const allPublic = await endpointsArePublic([
+        const rejected = await findRejectedEndpoint([
           data.authorization_endpoint,
           data.token_endpoint,
           data.revocation_endpoint,
           data.end_session_endpoint,
         ], validate);
-        if (!allPublic) {
-          errors.push(`${url} returned non-public or invalid endpoint URL`);
+        if (rejected !== null) {
+          // Name the endpoint: "unreachable" is the wrong lead when the IdP
+          // answered and only the address its endpoint resolves to was refused.
+          errors.push(
+            `${url} advertises ${rejected}, which is invalid or resolves to a non-public address ` +
+            '(set OAUTH_ALLOW_PRIVATE_ENDPOINTS=true if that host is internal on purpose)',
+          );
           continue;
         }
         return {
@@ -117,6 +148,9 @@ async function attemptDiscovery(
           token_endpoint: data.token_endpoint,
           revocation_endpoint: data.revocation_endpoint,
           end_session_endpoint: data.end_session_endpoint,
+          ...(Array.isArray(data.scopes_supported)
+            ? { scopes_supported: data.scopes_supported.filter((s: unknown): s is string => typeof s === 'string') }
+            : {}),
         };
       }
       errors.push(`${url} response missing required endpoints`);

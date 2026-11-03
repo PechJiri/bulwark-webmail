@@ -53,6 +53,15 @@ describe('TagPicker', () => {
     expect(onToggle).toHaveBeenCalledWith('work/clients');
   });
 
+  it('draws a tag only part of a selection carries as mixed', () => {
+    render(<TagPicker selectedIds={['work']} partialIds={['personal', 'from-elsewhere']} onToggle={() => {}} />);
+
+    expect(screen.getByText('Work').closest('button')).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByText('Personal').closest('button')).toHaveAttribute('aria-checked', 'mixed');
+    // An undefined tag on part of the selection is still listed, so it can come off.
+    expect(screen.getByText('from-elsewhere').closest('button')).toHaveAttribute('aria-checked', 'mixed');
+  });
+
   it('lists a tag it has no definition for, so it can be taken off', () => {
     const onToggle = vi.fn();
     const { rerender } = render(<TagPicker selectedIds={['from-elsewhere']} onToggle={onToggle} />);
@@ -113,5 +122,24 @@ describe('TagPicker', () => {
 
     expect(container.querySelectorAll('.ps-4').length).toBe(0);
     expect(screen.getByText('Clients')).toBeInTheDocument();
+  });
+});
+
+describe('TagPicker new tag', () => {
+  it('creates a tag from the picker and puts it on the message', async () => {
+    const { fireEvent, render, screen } = await import('@testing-library/react');
+    const { useSettingsStore } = await import('@/stores/settings-store');
+    const { TagPicker } = await import('../tag-picker');
+    useSettingsStore.setState({ emailKeywords: [] } as never);
+    const onToggle = vi.fn();
+    render(<TagPicker selectedIds={[]} onToggle={onToggle} />);
+    fireEvent.click(screen.getByTestId('tag-picker-new'));
+    const field = screen.getByRole('textbox', { name: 'new_tag_placeholder' });
+    fireEvent.change(field, { target: { value: 'Receipts' } });
+    fireEvent.keyDown(field, { key: 'Enter' });
+    const created = useSettingsStore.getState().emailKeywords;
+    expect(created).toHaveLength(1);
+    expect(created[0].label).toBe('Receipts');
+    expect(onToggle).toHaveBeenCalledWith(created[0].id);
   });
 });

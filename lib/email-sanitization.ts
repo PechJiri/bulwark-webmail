@@ -57,6 +57,25 @@ export function sanitizeEmailHtml(html: string): string {
   return sanitizeWithDataUriGuard(html, EMAIL_SANITIZE_CONFIG);
 }
 
+const COMPOSER_ISLAND_SANITIZE_CONFIG = {
+  ...EMAIL_SANITIZE_CONFIG,
+  // The composer's own markers (data-cid on inline images, the signature's
+  // data-signature-block brackets) must survive; data-* is inert.
+  ALLOW_DATA_ATTR: true,
+};
+
+/**
+ * Sanitize the verbatim HTML a composer island (quoted original, signature)
+ * picks up when the editor parses its wrapper. The islands render into the
+ * app document, not the sandboxed viewer frame, and their wrapper reaches
+ * the editor from places that never ran a sanitizer: a re-opened draft
+ * written by another client or another member of a shared mailbox, a paste.
+ */
+export function sanitizeComposerIslandHtml(html: string): string {
+  if (!html) return '';
+  return sanitizeWithDataUriGuard(html, COMPOSER_ISLAND_SANITIZE_CONFIG);
+}
+
 /**
  * Sanitize config for emails rendered inside a sandboxed iframe.
  * Allows <style> tags because CSS is scoped to the iframe document and
@@ -75,6 +94,27 @@ export const EMAIL_IFRAME_SANITIZE_CONFIG = {
  */
 export function sanitizeEmailHtmlForIframe(html: string): string {
   return sanitizeWithDataUriGuard(html, EMAIL_IFRAME_SANITIZE_CONFIG);
+}
+
+/**
+ * CSP for the srcdoc document a message body renders in. `default-src
+ * 'none'` forbids script even if the sanitizer ever lets one through.
+ *
+ * With external content blocked, img/media/font are limited to data:/blob:
+ * only - the network-level backstop for every tracking vector, including
+ * the ones the DOM walk can't see (CSS escapes, `<style>` url(),
+ * `@font-face`). cid: parts are rewritten to blob: URLs beforehand, so they
+ * survive the strict variant.
+ */
+export function emailIframeCsp(externalBlocked: boolean, appFontSources: readonly string[] = []): string {
+  // The folders of the app's own bundled fonts (Settings > Accessibility, mail
+  // in the app's font). A path, never the whole origin: a mail must not be able
+  // to make requests to the app's other URLs.
+  const appFonts = appFontSources.filter((src) => /^https?:\/\/[^\s;,'"]+\/$/.test(src));
+  const fontSrc = ['data:', ...appFonts].join(' ');
+  return externalBlocked
+    ? `default-src 'none'; img-src data: blob:; style-src 'unsafe-inline'; font-src ${fontSrc}; media-src data: blob:; base-uri 'none'; form-action 'none'; frame-src 'none'`
+    : `default-src 'none'; img-src data: blob: http: https:; style-src 'unsafe-inline'; font-src ${fontSrc} http: https:; media-src data: blob: http: https:; base-uri 'none'; form-action 'none'; frame-src 'none'`;
 }
 
 /** Outcome of {@link sanitizeEmailBodyForIframe}. */
@@ -236,11 +276,40 @@ export function sanitizeSignatureHtmlForDisplay(html: string): string {
  *
  * An untrusted plugin runs in a null-origin iframe, but whatever it returns
  * here lands in the host document and in the message the user then sends, so
- * it gets the same allowlist as a user-authored signature: formatting, links,
+ * it gets the allowlist of a user-authored signature: formatting, links,
  * images and tables, no script, no event handlers, no external URI schemes.
+ * Plus the structure the composer itself can write (lists, quotes, headings,
+ * code), so a plugin's list of links or rewritten paragraph keeps its shape.
  */
+const PLUGIN_BODY_SANITIZE_CONFIG = {
+  ...SIGNATURE_SANITIZE_CONFIG,
+  ALLOWED_TAGS: [...SIGNATURE_SANITIZE_CONFIG.ALLOWED_TAGS, 'ul', 'ol', 'li', 'blockquote', 'h1', 'h2', 'h3', 'pre', 'code', 's', 'hr'],
+};
+
+/**
+ * Drop images in plugin-authored HTML unless they are embedded. A plugin's
+ * network reach is its manifest's `httpOrigins`, enforced by the sandbox
+ * CSP; an `https:` image the host page then loads for it is a request to
+ * any origin, carrying whatever the plugin put in the URL. A user's own
+ * signature may keep remote images (restrictSignatureImages); a plugin's
+ * text may not.
+ */
+function restrictPluginImages(node: Element): void {
+  if (node.tagName !== 'IMG') return;
+  const src = node.getAttribute('src');
+  if (!src || !/^(?:cid:|data:image\/(?:png|jpe?g|gif|webp);base64,)/i.test(src)) {
+    node.remove();
+  }
+}
+
 export function sanitizePluginBodyHtml(html: string): string {
-  return sanitizeSignatureHtml(html);
+  if (!html?.trim()) return '';
+  DOMPurify.addHook('afterSanitizeAttributes', restrictPluginImages);
+  try {
+    return DOMPurify.sanitize(html, PLUGIN_BODY_SANITIZE_CONFIG);
+  } finally {
+    DOMPurify.removeAllHooks();
+  }
 }
 
 /**
@@ -395,14 +464,18 @@ export function restrictDataUriResourcesOnNode(node: Element): void {
  * though they don't literally start with "https://" (the `imgNewlineSrc`
  * tracking bypass). Protocol-relative `//host` is external too. data:, blob:,
  * and cid: are inline/local and never count as external.
+ *
+ * The parser also reads `\` as `/` in http(s) URLs and needs no slashes
+ * after the scheme, so `/\host`, `https:\\host` and `https:host` all load
+ * from another host.
  */
 export function isExternalResourceUrl(value: string | null | undefined): boolean {
   if (!value) return false;
   // Mirror the URL parser: drop every ASCII C0-control and space char it
   // ignores (leading/trailing trim plus tab/newline/CR removed anywhere).
   // eslint-disable-next-line no-control-regex
-  const normalized = value.replace(/[\u0000-\u0020]+/g, '');
-  return /^(?:https?:\/\/|\/\/)/i.test(normalized);
+  const normalized = value.replace(/[\u0000-\u0020]+/g, '').replace(/\\/g, '/');
+  return /^(?:https?:|\/\/)/i.test(normalized);
 }
 
 
@@ -420,13 +493,30 @@ export function isHttpLinkHref(href: string | null | undefined): boolean {
 }
 
 /**
+ * Whether a clicked message-body link may be handed to window.open(). Web links
+ * and links to external protocol handlers (tel:, sms:, ...) are fine. Anything
+ * that resolves inside our own origin is not: blob: URLs (a cid: part re-typed
+ * by the sender, GHSA-xvjh-v9c6-qcvc), data:, and bare relative paths, which
+ * would open a webmail route of the sender's choosing in a new tab.
+ */
+export function isOpenableLinkHref(href: string | null | undefined): boolean {
+  if (!href) return false;
+  if (isHttpLinkHref(href)) return true;
+  // eslint-disable-next-line no-control-regex
+  const normalized = href.replace(/[\u0000-\u0020]+/g, '');
+  return /^(?:ftps?|tel|sms|callto|xmpp):/i.test(normalized);
+}
+
+/**
  * Give one `<a>` the new-tab treatment uniformly across the iframe render paths
  * (the DOMPurify hook and the post-render DOM walk in email-viewer): http(s)
  * links get target=_blank + rel; other schemes have them stripped so they don't
  * spawn a blank tab. (The plaintext path relies on ADD_URI_SAFE_ATTR instead.)
  */
 export function applyNewTabToAnchor(node: Element): void {
-  if (node.tagName !== 'A') return;
+  // <area> in an image map is a link too; left alone it kept whatever
+  // target/rel the sender wrote (rel=opener: reverse tabnabbing).
+  if (node.tagName !== 'A' && node.tagName !== 'AREA') return;
   if (isHttpLinkHref(node.getAttribute('href'))) {
     node.setAttribute('target', '_blank');
     node.setAttribute('rel', 'noopener noreferrer');
@@ -452,23 +542,57 @@ export function decodeCssEscapes(value: string): string {
   });
 }
 
-const CSS_URL_PATTERN = /url\(\s*(['"]?)([^)]*?)\1\s*\)/gi;
+// A url() token also ends at the end of the declaration list: a style
+// attribute's last `url(https://t` needs no closing parenthesis.
+const CSS_URL_PATTERN = /url\(\s*(['"]?)([^)]*?)\1\s*(?:\)|$)/gi;
+// image-set() takes plain strings as well as url()s.
+const CSS_IMAGE_SET_PATTERN = /(?:-webkit-)?image-set\(([^()]*(?:\([^()]*\)[^()]*)*)\)/gi;
+const CSS_STRING_PATTERN = /(['"])(.*?)\1/g;
 
-/** True if any `url(...)` in a CSS string resolves to an external resource. */
-export function styleHasExternalUrl(style: string): boolean {
+function imageSetHasExternalUrl(args: string): boolean {
   let found = false;
-  style.replace(CSS_URL_PATTERN, (full, _q, inner) => {
-    if (isExternalResourceUrl(decodeCssEscapes(inner))) found = true;
+  args.replace(CSS_STRING_PATTERN, (full, _q, inner: string) => {
+    if (isExternalResourceUrl(inner)) found = true;
+    return full;
+  });
+  return found || styleHasExternalCssUrl(args);
+}
+
+function styleHasExternalCssUrl(css: string): boolean {
+  let found = false;
+  css.replace(CSS_URL_PATTERN, (full, _q, inner: string) => {
+    if (isExternalResourceUrl(inner)) found = true;
     return full;
   });
   return found;
 }
 
-/** Replace every external `url(...)` in a CSS string with an empty `url()`. */
+/**
+ * True if any `url(...)` or `image-set(...)` in a CSS string resolves to an
+ * external resource. Escapes are decoded first: `\75 rl(` is `url(`.
+ */
+export function styleHasExternalUrl(style: string): boolean {
+  const decoded = decodeCssEscapes(style);
+  if (styleHasExternalCssUrl(decoded)) return true;
+  let found = false;
+  decoded.replace(CSS_IMAGE_SET_PATTERN, (full, args: string) => {
+    if (imageSetHasExternalUrl(args)) found = true;
+    return full;
+  });
+  return found;
+}
+
+/**
+ * Replace every external `url(...)` in a CSS string with an empty `url()`
+ * and drop an `image-set(...)` that names one. Returns the input unchanged
+ * when nothing external is present; otherwise the escape-decoded CSS, since
+ * an escaped `url` keyword can only be found and removed once decoded.
+ */
 export function stripExternalCssUrls(style: string): string {
-  return style.replace(CSS_URL_PATTERN, (full, _q, inner) =>
-    isExternalResourceUrl(decodeCssEscapes(inner)) ? 'url()' : full
-  );
+  if (!styleHasExternalUrl(style)) return style;
+  return decodeCssEscapes(style)
+    .replace(CSS_IMAGE_SET_PATTERN, (full, args: string) => (imageSetHasExternalUrl(args) ? 'none' : full))
+    .replace(CSS_URL_PATTERN, (full, _q, inner: string) => (isExternalResourceUrl(inner) ? 'url()' : full));
 }
 
 /**
@@ -487,13 +611,20 @@ export function stripExternalCssUrls(style: string): string {
 export function stripExternalStyleSheetCss(css: string): string {
   if (!css) return css;
   const decoded = decodeCssEscapes(css);
-  if (!/url\(|@import/i.test(decoded)) return css;
+  if (!/url\(|@import|image-set\(/i.test(decoded)) return css;
   let changed = false;
   // External url(...) anywhere in the sheet (also covers `@import url(...)`).
   let result = decoded.replace(CSS_URL_PATTERN, (full, _q, inner: string) => {
     if (isExternalResourceUrl(inner)) {
       changed = true;
       return 'url()';
+    }
+    return full;
+  });
+  result = result.replace(CSS_IMAGE_SET_PATTERN, (full, args: string) => {
+    if (imageSetHasExternalUrl(args)) {
+      changed = true;
+      return 'none';
     }
     return full;
   });
@@ -614,6 +745,59 @@ export function blockExternalResourcesOnNode(node: Element): boolean {
   return blocked;
 }
 
+const PARKED_ATTR_PREFIX = 'data-bulwark-remote-';
+const PARKABLE_URL_ATTRS = ['src', 'poster', 'background'] as const;
+
+/**
+ * Display-only counterpart of {@link blockExternalResourcesOnNode} for HTML
+ * that is rendered in the app document itself (the quoted original in the
+ * composer) and still has to be sent as written. Every external resource
+ * reference is parked in a `data-bulwark-remote-*` attribute so nothing
+ * loads, and {@link restoreRemoteResources} puts it back exactly. Parsing
+ * happens in an inert DOMParser document, which fetches nothing.
+ */
+export function parkRemoteResources(html: string): { html: string; parked: boolean } {
+  const doc = parseHtmlSafely(`<body>${html}</body>`);
+  let parked = false;
+  for (const el of Array.from(doc.body.querySelectorAll('*'))) {
+    for (const attr of PARKABLE_URL_ATTRS) {
+      const value = el.getAttribute(attr);
+      if (isExternalResourceUrl(value)) {
+        el.setAttribute(PARKED_ATTR_PREFIX + attr, value!);
+        el.removeAttribute(attr);
+        parked = true;
+      }
+    }
+    const srcset = el.getAttribute('srcset');
+    if (srcset && srcsetHasExternalUrl(srcset)) {
+      el.setAttribute(PARKED_ATTR_PREFIX + 'srcset', srcset);
+      el.removeAttribute('srcset');
+      parked = true;
+    }
+    const style = el.getAttribute('style');
+    if (style && styleHasExternalUrl(style)) {
+      el.setAttribute(PARKED_ATTR_PREFIX + 'style', style);
+      el.setAttribute('style', stripExternalCssUrls(style));
+      parked = true;
+    }
+  }
+  return { html: parked ? doc.body.innerHTML : html, parked };
+}
+
+/** Undo {@link parkRemoteResources} so the HTML carries its original references again. */
+export function restoreRemoteResources(html: string): string {
+  if (!html.includes(PARKED_ATTR_PREFIX)) return html;
+  const doc = parseHtmlSafely(`<body>${html}</body>`);
+  for (const el of Array.from(doc.body.querySelectorAll('*'))) {
+    for (const attr of Array.from(el.attributes)) {
+      if (!attr.name.startsWith(PARKED_ATTR_PREFIX)) continue;
+      el.setAttribute(attr.name.slice(PARKED_ATTR_PREFIX.length), attr.value);
+      el.removeAttribute(attr.name);
+    }
+  }
+  return doc.body.innerHTML;
+}
+
 /**
  * Safe HTML parsing without execution
  * Use instead of innerHTML for detection/parsing
@@ -676,7 +860,9 @@ export function plainTextToSafeHtml(text: string, linkClass = ''): string {
  * and hides it if it contains no meaningful visible content.
  */
 export function collapseBlockedImageContainers(html: string): string {
-  const doc = parseHtmlSafely(html);
+  // Wrapped in <body> so a leading <style> stays in the body instead of being
+  // hoisted into <head>, where body.innerHTML below would drop it.
+  const doc = parseHtmlSafely(`<body>${html}</body>`);
   const blockedImages = doc.querySelectorAll('img[data-blocked-src]');
 
   blockedImages.forEach((img) => {

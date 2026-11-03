@@ -3,13 +3,16 @@ import {
   AUTO_TIME_ZONE,
   displayNow,
   fromDisplayDate,
+  fromWallClock,
   fromZonedDisplayDate,
   getBrowserTimeZone,
   getTimeZoneOffsetMs,
   getWallClock,
   isDisplayToday,
   isValidTimeZone,
+  canonicalTimeZone,
   listTimeZones,
+  moveLocalDateTime,
   resolveTimeZone,
   toDisplayDate,
   toZonedDisplayDate,
@@ -45,6 +48,14 @@ describe('resolveTimeZone', () => {
 
   it('returns a valid explicit zone unchanged', () => {
     expect(resolveTimeZone('Asia/Tokyo', 'Europe/Berlin')).toBe('Asia/Tokyo');
+  });
+
+  // Stalwart 1.0 refuses "europe/berlin" as a query's timeZone, and both
+  // 0.16 and 1.0 drop it from an event, storing the event as floating.
+  it('spells a zone typed in another case the way Intl does', () => {
+    expect(resolveTimeZone('europe/berlin', 'UTC')).toBe('Europe/Berlin');
+    expect(canonicalTimeZone('AMERICA/NEW_YORK')).toBe('America/New_York');
+    expect(canonicalTimeZone('Mars/Olympus_Mons')).toBeNull();
   });
 
   it('validates zone ids against Intl', () => {
@@ -109,10 +120,31 @@ describe('wall-clock helpers', () => {
     }
   });
 
+  it('moves a LocalDateTime from one zone to another at the same instant', () => {
+    expect(moveLocalDateTime('2026-09-01T00:00:00', 'Europe/Berlin', 'UTC')).toBe('2026-08-31T22:00:00');
+    expect(moveLocalDateTime('2026-09-30T23:59:59', 'Asia/Tokyo', 'UTC')).toBe('2026-09-30T14:59:59');
+    // Just after the spring-forward gap in New York (EDT, UTC-4).
+    expect(moveLocalDateTime('2026-03-08T03:30:00', 'America/New_York', 'UTC')).toBe('2026-03-08T07:30:00');
+    expect(moveLocalDateTime('2026-09-01T00:00:00', 'UTC', 'Asia/Tokyo')).toBe('2026-09-01T09:00:00');
+    // Same zone, a value with an offset, and garbage stay as they are.
+    expect(moveLocalDateTime('2026-09-01T00:00:00', 'Asia/Tokyo', 'Asia/Tokyo')).toBe('2026-09-01T00:00:00');
+    expect(moveLocalDateTime('2026-09-01T00:00:00Z', 'Asia/Tokyo', 'UTC')).toBe('2026-09-01T00:00:00Z');
+    expect(moveLocalDateTime('soon', 'Asia/Tokyo', 'UTC')).toBe('soon');
+  });
+
   it('keeps invalid dates invalid instead of throwing', () => {
     const bad = new Date('nope');
     expect(isNaN(toZonedDisplayDate(bad, 'Europe/Berlin').getTime())).toBe(true);
     expect(isNaN(fromZonedDisplayDate(bad, 'Europe/Berlin').getTime())).toBe(true);
+  });
+
+  it('reads a wall-clock in a zone straight from its fields', () => {
+    const at = (year: number, month: number, day: number, hour: number, minute: number, zone: string) =>
+      fromWallClock({ year, month, day, hour, minute, second: 0 }, zone).toISOString();
+    expect(at(2026, 10, 5, 8, 0, 'Europe/Berlin')).toBe('2026-10-05T06:00:00.000Z');
+    expect(at(2026, 10, 26, 18, 0, 'Europe/Berlin')).toBe('2026-10-26T17:00:00.000Z');
+    // 02:30 on 29 March is skipped in Berlin, but exists in New York.
+    expect(at(2026, 3, 29, 2, 30, 'America/New_York')).toBe('2026-03-29T06:30:00.000Z');
   });
 });
 
@@ -171,5 +203,40 @@ describe('mail timestamp formatting honours the override', () => {
     const received = new Date('2026-07-01T14:00:00Z');
     expect(formatDate(received)).toContain('23:00');
     expect(formatDateTime(received, '24h', { year: 'numeric', month: 'short', day: 'numeric' })).toContain('23:00');
+  });
+
+  it.each(['smart', 'relative', 'full'] as const)('formatDate returns "" for an invalid date in %s mode (#1099)', (dateFormat) => {
+    useSettingsStore.setState({ timeZone: 'Asia/Tokyo', dateFormat });
+    expect(formatDate('not-a-valid-date')).toBe('');
+    expect(formatDate('10000-01-01T00:00:00Z')).toBe('');
+    expect(formatDate(new Date('nope'))).toBe('');
+    expect(formatDate(undefined as unknown as string)).toBe('');
+  });
+
+  it("formatDate uses Gmail's buckets for Mountain View lists", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-01T16:00:00Z'));
+    useSettingsStore.setState({ dateLocale: 'en-US', timeFormat: '12h' });
+    const mv = { listStyle: 'mountain-view' } as const;
+
+    expect(formatDate(new Date('2026-07-01T14:05:00Z'), mv)).toBe('02:05 PM');
+    // Two days ago is a date, not a weekday, and this year leaves the year out.
+    expect(formatDate(new Date('2026-06-29T14:05:00Z'), mv)).toBe('Jun 29');
+    expect(formatDate(new Date('2025-10-10T14:05:00Z'), mv)).toBe('10/10/25');
+    // Without it the default buckets stay.
+    expect(formatDate(new Date('2026-06-29T14:05:00Z'))).toBe('Mon 02:05 PM');
+  });
+
+  it('formatDate overrides preview other options without touching the store', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-01T16:00:00Z'));
+    const older = new Date('2026-05-01T15:31:00Z');
+    useSettingsStore.setState({ dateFormat: 'smart', dateLocale: 'en-US' });
+
+    expect(formatDate(older)).toBe('05/01/2026');
+    expect(formatDate(older, { dateLocale: 'iso' })).toBe('2026-05-01');
+    expect(formatDate(older, { dateLocale: 'en-GB' })).toBe('01/05/2026');
+    expect(formatDate(older, { dateFormat: 'full', dateLocale: 'iso' })).toContain('15:31');
+    expect(useSettingsStore.getState()).toMatchObject({ dateFormat: 'smart', dateLocale: 'en-US' });
   });
 });

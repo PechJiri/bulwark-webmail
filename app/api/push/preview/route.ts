@@ -1,12 +1,19 @@
 import { cookies } from 'next/headers';
 import { NextRequest, NextResponse } from 'next/server';
 import { logger } from '@/lib/logger';
+import { cleanPreview } from '@/lib/utils';
 import { MAX_ACCOUNT_SLOTS } from '@/lib/account-utils';
 import { readStalwartAuthContextFromStore } from '@/lib/stalwart/auth-context';
 import {
   getStalwartCredentials,
   type StalwartCredentials,
 } from '@/lib/stalwart/credentials';
+import { fetchJmapServer, isTrustedJmapServerUrl } from '@/lib/stalwart/server-fetch';
+import { rebaseApiUrl } from '@/lib/stalwart/jmap-api';
+import { forwardedClientHeaders, loginClientAddress } from '@/lib/auth/client-address';
+import { DisallowedUrlError } from '@/lib/security/url-guard';
+import { UPSTREAM_JSON_MAX_BYTES, UpstreamBodyTooLargeError, readJsonCapped } from '@/lib/security/capped-body';
+import { serverDevicePolicy } from '@/lib/admin/server-device-policy';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -15,15 +22,35 @@ interface ResolvedTarget {
   authHeader: string;
   apiUrl: string;
   accountId: string;
+  /** See StalwartCredentials.trusted - false routes through the guarded fetch. */
+  trusted: boolean;
+  /** The login, for its device policy. */
+  serverUrl: string;
+  username: string;
+  accountName?: string;
+  /**
+   * Cookie slot of the login that owns the account. Handed back so a click
+   * on the notification opens the message in that login: the worker knows
+   * only the JMAP account id, which can repeat across servers.
+   */
+  slot?: number;
 }
 
 // When the SW passes ?accountId=, we need the slot whose JMAP session owns
 // that account - not just "the first signed-in slot", which is what
 // getStalwartCredentials() defaults to. Probe each candidate's session in
-// parallel and return the first match.
-async function resolveTargetForAccount(accountId: string): Promise<ResolvedTarget | null> {
+// parallel and return the first match, the login whose own account it is
+// ahead of the others: an account with a folder shared out is listed in the
+// session of everyone it is shared with, who sees only that folder - not its
+// Inbox, nor the message that just arrived there.
+//
+// The push names nothing but the account id, and ids repeat across servers
+// (and a group account is listed by each member). When that leaves more than
+// one login, answer 'ambiguous' rather than guess: a wrong guess previews
+// another login's mail and opens it there.
+async function resolveTargetForAccount(accountId: string, forwarded: Record<string, string>): Promise<ResolvedTarget | 'ambiguous' | null> {
   const cookieStore = await cookies();
-  const probes: Promise<ResolvedTarget | null>[] = [];
+  const probes: Promise<{ target: ResolvedTarget; own: boolean } | null>[] = [];
   for (let slot = 0; slot < MAX_ACCOUNT_SLOTS; slot++) {
     const ctx = readStalwartAuthContextFromStore(cookieStore, slot);
     if (!ctx) continue;
@@ -31,41 +58,57 @@ async function resolveTargetForAccount(accountId: string): Promise<ResolvedTarge
     probes.push(
       (async () => {
         try {
-          const res = await fetch(`${serverUrl}/.well-known/jmap`, {
-            headers: { Authorization: ctx.authHeader },
-          });
+          const trusted = await isTrustedJmapServerUrl(serverUrl);
+          const res = await fetchJmapServer(`${serverUrl}/.well-known/jmap`, {
+            headers: { Authorization: ctx.authHeader, ...forwarded },
+          }, trusted);
           if (!res.ok) return null;
-          const session = (await res.json()) as {
+          const session = (await readJsonCapped(res, UPSTREAM_JSON_MAX_BYTES)) as {
             apiUrl?: string;
             primaryAccounts?: Record<string, string>;
+            accounts?: Record<string, unknown>;
           };
           const mailAccountId = session.primaryAccounts?.['urn:ietf:params:jmap:mail'];
-          if (!session.apiUrl || !mailAccountId) return null;
-          if (mailAccountId !== accountId) return null;
-          return { authHeader: ctx.authHeader, apiUrl: session.apiUrl, accountId: mailAccountId };
+          // On the host this process reaches, not the server's public one (#627).
+          const apiUrl = rebaseApiUrl(session, serverUrl);
+          if (!apiUrl || !mailAccountId) return null;
+          // Shared and group mailboxes are never the primary mail account -
+          // they only appear in session.accounts. Accept those too, or the
+          // SW falls back to a generic "New mail" notification for them. (#839)
+          const isSharedAccount =
+            accountId !== mailAccountId &&
+            Object.prototype.hasOwnProperty.call(session.accounts ?? {}, accountId);
+          if (mailAccountId !== accountId && !isSharedAccount) return null;
+          return {
+            target: { authHeader: ctx.authHeader, apiUrl, accountId, trusted, slot, serverUrl, username: ctx.username, accountName: ctx.accountName },
+            own: mailAccountId === accountId,
+          };
         } catch {
           return null;
         }
       })(),
     );
   }
-  const results = await Promise.all(probes);
-  return results.find((r): r is ResolvedTarget => r !== null) ?? null;
+  const results = (await Promise.all(probes)).filter((r) => r !== null);
+  const owners = results.filter((r) => r.own);
+  if (owners.length === 1) return owners[0].target;
+  if (results.length === 1) return results[0].target;
+  return results.length > 1 ? 'ambiguous' : null;
 }
 
-async function resolveDefaultTarget(creds: StalwartCredentials): Promise<ResolvedTarget | null> {
-  const sessionRes = await fetch(`${creds.serverUrl}/.well-known/jmap`, {
-    headers: { Authorization: creds.authHeader },
-  });
+async function resolveDefaultTarget(creds: StalwartCredentials, forwarded: Record<string, string>): Promise<ResolvedTarget | null> {
+  const sessionRes = await fetchJmapServer(`${creds.serverUrl}/.well-known/jmap`, {
+    headers: { Authorization: creds.authHeader, ...forwarded },
+  }, creds.trusted);
   if (!sessionRes.ok) return null;
-  const session = (await sessionRes.json()) as {
+  const session = (await readJsonCapped(sessionRes, UPSTREAM_JSON_MAX_BYTES)) as {
     apiUrl?: string;
     primaryAccounts?: Record<string, string>;
   };
-  const apiUrl = session.apiUrl;
+  const apiUrl = rebaseApiUrl(session, creds.serverUrl);
   const accountId = session.primaryAccounts?.['urn:ietf:params:jmap:mail'];
   if (!apiUrl || !accountId) return null;
-  return { authHeader: creds.authHeader, apiUrl, accountId };
+  return { authHeader: creds.authHeader, apiUrl, accountId, trusted: creds.trusted, serverUrl: creds.serverUrl, username: creds.username, accountName: creds.accountName };
 }
 
 /**
@@ -92,34 +135,42 @@ export async function GET(request: NextRequest) {
     // asks for that one instead of guessing "newest unread in the Inbox" -
     // which is wrong whenever Sieve filed the new message into a folder.
     const requestedEmailId = request.nextUrl.searchParams.get('emailId');
+    const forwarded = forwardedClientHeaders(loginClientAddress(request));
 
     let target: ResolvedTarget | null = null;
     let authHeader: string;
     if (requestedAccountId) {
-      target = await resolveTargetForAccount(requestedAccountId);
-      if (!target) {
+      const resolved = await resolveTargetForAccount(requestedAccountId, forwarded);
+      if (!resolved) {
         return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
       }
+      // The service worker shows its generic notification, and a click opens
+      // the app without switching login.
+      if (resolved === 'ambiguous') {
+        return NextResponse.json({ error: 'Account is in more than one signed-in login' }, { status: 409 });
+      }
+      target = resolved;
       authHeader = target.authHeader;
     } else {
       const creds = await getStalwartCredentials(request);
       if (!creds) {
         return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
       }
-      target = await resolveDefaultTarget(creds);
+      target = await resolveDefaultTarget(creds, forwarded);
       if (!target) {
         return NextResponse.json({ error: 'JMAP session failed' }, { status: 502 });
       }
       authHeader = creds.authHeader;
     }
 
-    const { apiUrl, accountId } = target;
+    const { apiUrl, accountId, trusted } = target;
 
-    const inboxRes = await fetch(apiUrl, {
+    const inboxRes = await fetchJmapServer(apiUrl, {
       method: 'POST',
       headers: {
         Authorization: authHeader,
         'Content-Type': 'application/json',
+        ...forwarded,
       },
       body: JSON.stringify({
         using: ['urn:ietf:params:jmap:core', 'urn:ietf:params:jmap:mail'],
@@ -131,22 +182,41 @@ export async function GET(request: NextRequest) {
           ],
         ],
       }),
-    });
+    }, trusted);
 
     if (!inboxRes.ok) {
       return NextResponse.json({ error: 'JMAP mailbox query failed' }, { status: 502 });
     }
 
-    const inboxData = (await inboxRes.json()) as {
+    const inboxData = (await readJsonCapped(inboxRes, UPSTREAM_JSON_MAX_BYTES)) as {
       methodResponses: [string, Record<string, unknown>, string][];
     };
 
     const inboxBody = inboxData.methodResponses.find(
-      ([method]) => method === 'Mailbox/query',
+      ([method, , callId]) => method === 'Mailbox/query' && callId === 'mb',
     )?.[1] as { ids?: string[] } | undefined;
 
-    const inboxId = inboxBody?.ids?.[0];
-    const emailProperties = ['id', 'threadId', 'from', 'subject', 'preview', 'receivedAt'];
+    // A method-level JMAP error still has HTTP 200. Do not turn it into
+    // an empty Inbox: the service worker would silently discard the push.
+    if (!Array.isArray(inboxBody?.ids)) {
+      return NextResponse.json({ error: 'JMAP mailbox query failed' }, { status: 502 });
+    }
+
+    const inboxId = inboxBody.ids[0];
+    // Organisation > Devices > Push without sender and subject, for this
+    // login's scopes (worked out from its own session): the message's
+    // sender, subject and text are never read, so they can't reach the
+    // notification, the push service or the lock screen. Unknown counts as on.
+    const redacted = await serverDevicePolicy({
+      serverUrl: target.serverUrl,
+      authHeader,
+      username: target.username,
+      accountName: target.accountName,
+      trusted,
+    }).then((devices) => devices.pushWithoutContent, () => true);
+    const emailProperties = redacted
+      ? ['id', 'threadId', 'receivedAt']
+      : ['id', 'threadId', 'from', 'subject', 'preview', 'receivedAt'];
 
     if (!inboxId && !requestedEmailId) {
       return NextResponse.json({
@@ -205,20 +275,36 @@ export async function GET(request: NextRequest) {
       methodCalls,
     };
 
-    const jmapRes = await fetch(apiUrl, {
+    const jmapRes = await fetchJmapServer(apiUrl, {
       method: 'POST',
       headers: {
         Authorization: authHeader,
         'Content-Type': 'application/json',
+        ...forwarded,
       },
       body: JSON.stringify(requestBody),
-    });
+    }, trusted);
     if (!jmapRes.ok) {
       return NextResponse.json({ error: 'JMAP request failed' }, { status: 502 });
     }
-    const data = (await jmapRes.json()) as {
+    const data = (await readJsonCapped(jmapRes, UPSTREAM_JSON_MAX_BYTES)) as {
       methodResponses: [string, Record<string, unknown>, string][];
     };
+
+    // Missing/failed method responses are preview failures, not proof that
+    // there is no unread mail. A non-2xx response lets the SW show its fallback.
+    // The message the server named, once read, is a complete preview on its
+    // own, whatever became of the Inbox lookups next to it.
+    const resultOf = (name: string, id: string) =>
+      data.methodResponses.find(([method, , callId]) => method === name && callId === id)?.[1];
+    const failed = (methodCalls as [string, unknown, string][]).some(([name, , id]) => {
+      const result = resultOf(name, id);
+      return !result || (name === 'Email/query' ? !Array.isArray(result.ids) : !Array.isArray(result.list));
+    });
+    const deliveredList = resultOf('Email/get', 'delivered')?.list;
+    if (failed && !(Array.isArray(deliveredList) && deliveredList.length > 0)) {
+      return NextResponse.json({ error: 'JMAP email query failed' }, { status: 502 });
+    }
 
     type EmailLite = {
       id: string;
@@ -234,7 +320,9 @@ export async function GET(request: NextRequest) {
     let unreadTotal = 0;
     for (const [method, body, callId] of data.methodResponses) {
       if (method === 'Email/query') {
-        unreadTotal = ((body as { total?: number }).total) ?? 0;
+        // A server that leaves out the optional total still lists the ids.
+        const query = body as { total?: number; ids?: unknown[] };
+        unreadTotal = typeof query.total === 'number' ? query.total : (query.ids?.length ?? 0);
       }
       if (method === 'Email/get') {
         const list = (body as { list?: EmailLite[] }).list ?? [];
@@ -251,11 +339,26 @@ export async function GET(request: NextRequest) {
         unreadTotal = Math.max(unreadTotal, 1);
       }
       email = delivered;
+    } else if (requestedEmailId) {
+      // The server named the message that arrived and it could not be read -
+      // deleted since, or filed where this login cannot see it. "Newest unread
+      // in the Inbox" is then some other message, and announcing it would be
+      // confidently wrong. Name no message: the unread total still comes back,
+      // so the SW posts its generic toast instead of staying silent.
+      email = null;
     }
+
+    // Some servers build the preview from HTML without skipping <style>; a
+    // notification that opens on a style sheet says nothing.
+    if (email?.preview) email = { ...email, preview: cleanPreview(email.preview) };
+    // Whatever the server sent anyway, only what a click needs goes back.
+    if (redacted && email) email = { id: email.id, threadId: email.threadId, receivedAt: email.receivedAt ?? null };
 
     return NextResponse.json({
       email,
       unreadTotal,
+      ...(redacted ? { redacted: true } : {}),
+      ...(target.slot !== undefined ? { slot: target.slot } : {}),
     }, {
       headers: {
         // SW already gates on its own logic - don't let push events get
@@ -264,6 +367,14 @@ export async function GET(request: NextRequest) {
       },
     });
   } catch (error) {
+    if (error instanceof DisallowedUrlError) {
+      logger.warn('push preview refused non-public server address', { error: error.message });
+      return NextResponse.json({ error: 'JMAP server address is not allowed' }, { status: 502 });
+    }
+    if (error instanceof UpstreamBodyTooLargeError) {
+      logger.warn('push preview: JMAP response too large', { maxBytes: error.maxBytes });
+      return NextResponse.json({ error: 'JMAP server response is too large' }, { status: 502 });
+    }
     // `fetch failed` from undici is too generic to debug - the real reason
     // (ENOTFOUND, ECONNREFUSED, TLS error, …) is on `error.cause`.
     const err = error as Error & { cause?: { code?: string; message?: string } };

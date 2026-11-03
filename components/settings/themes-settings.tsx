@@ -1,18 +1,35 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useTranslations } from 'next-intl';
 import { useThemeStore } from '@/stores/theme-store';
 import { SettingsSection } from './settings-section';
 import { cn } from '@/lib/utils';
-import { Check, Lock } from 'lucide-react';
+import { Check, Lock, ChevronDown, ChevronUp } from '@/components/icons';
+import { Button } from '@/components/ui/button';
+
+/** Cards shown before "Show all": one row of the grid. */
+const COLLAPSED_THEME_COUNT = 3;
 import { toast } from '@/stores/toast-store';
 import { usePolicyStore } from '@/stores/policy-store';
 
-export function ThemesSettings() {
+/**
+ * The theme gallery. On its own it is a section; `embedded` draws only the
+ * grid (with its lock notice) inside the Appearance page's Theme section,
+ * right under the light/dark choice.
+ */
+export function ThemesSettings({ embedded }: { embedded?: boolean } = {}) {
+  const t = useTranslations('settings.themes');
   const { installedThemes, activeThemeId, activateTheme } = useThemeStore();
   const { isThemeDisabled, getThemePolicy, getForcedThemeId, isThemeForceEnabled } = usePolicyStore();
   const themePolicy = getThemePolicy();
   const forcedThemeId = getForcedThemeId(installedThemes.map((theme) => theme.id));
+
+  // Fetch again on open, so a theme the admin just installed in this tab
+  // shows up without a reload.
+  useEffect(() => {
+    void useThemeStore.getState().syncServerThemes();
+  }, []);
 
   // Render each preview in the variant matching the app's current mode, and
   // keep it in sync when the user toggles light/dark elsewhere.
@@ -30,6 +47,27 @@ export function ThemesSettings() {
   const visibleThemes = installedThemes.filter(
     theme => !isThemeDisabled(theme.id, !!theme.builtIn)
   );
+
+  // One row of cards until "Show all": the gallery is long and most people
+  // never change the theme. The active theme always stays in that row.
+  const [expanded, setExpanded] = useState(false);
+  const cards: (typeof visibleThemes[number] | null)[] = [null, ...visibleThemes];
+  const activeIndex = Math.max(0, cards.findIndex((theme) => (theme?.id ?? null) === activeThemeId));
+  const collapsed = !expanded && cards.length > COLLAPSED_THEME_COUNT;
+  const shownCards = collapsed
+    ? (activeIndex < COLLAPSED_THEME_COUNT
+        ? cards.slice(0, COLLAPSED_THEME_COUNT)
+        : [...cards.slice(0, COLLAPSED_THEME_COUNT - 1), cards[activeIndex]])
+    : cards;
+  // A search result for a hidden theme asks the gallery to open first.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const label = (e as CustomEvent<{ label?: string }>).detail?.label;
+      if (label && visibleThemes.some((theme) => theme.name === label)) setExpanded(true);
+    };
+    window.addEventListener('settings-reveal', handler);
+    return () => window.removeEventListener('settings-reveal', handler);
+  }, [visibleThemes]);
 
   useEffect(() => {
     if (forcedThemeId && activeThemeId !== forcedThemeId) {
@@ -53,41 +91,42 @@ export function ThemesSettings() {
 
     if (forcedThemeId && id !== forcedThemeId) {
       const forcedTheme = installedThemes.find((theme) => theme.id === forcedThemeId);
-      toast.info(`Theme "${forcedTheme?.name ?? 'Admin theme'}" is forced by admin and cannot be changed`);
+      toast.info(t('forced', { name: forcedTheme?.name ?? t('admin_theme') }));
       return;
     }
 
     activateTheme(id);
-    toast.success(id ? 'Theme activated' : 'Default theme restored');
+    toast.success(id ? t('activated') : t('default_restored'));
   };
 
-  return (
-    <SettingsSection title="Themes" description="Choose from themes deployed by your administrator and built-in presets.">
-
+  const grid = (
+    <>
       {forcedThemeId && (
         <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/40 dark:bg-amber-950/20 dark:text-amber-300">
-          Theme selection is locked by an administrator.
+          {t('locked')}
         </div>
       )}
 
       {/* Theme Grid */}
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-        {/* Default theme card */}
-        <ThemeCard
-          name="Default"
-          author="Bulwark"
-          isDefaultTheme
-          variants={['light', 'dark']}
-          isDark={isDark}
-          isActive={activeThemeId === null}
-          isBuiltIn
-          isDefault={!themePolicy.defaultThemeId}
-          disabled={Boolean(forcedThemeId)}
-          onActivate={() => handleActivate(null)}
-        />
-
-        {/* Installed themes */}
-        {visibleThemes.map(theme => {
+        {shownCards.map((theme) => {
+          if (!theme) {
+            return (
+              <ThemeCard
+                key="default"
+                name={t('default_name')}
+                author="Bulwark"
+                isDefaultTheme
+                variants={['light', 'dark']}
+                isDark={isDark}
+                isActive={activeThemeId === null}
+                isBuiltIn
+                isDefault={!themePolicy.defaultThemeId}
+                disabled={Boolean(forcedThemeId)}
+                onActivate={() => handleActivate(null)}
+              />
+            );
+          }
           const isForceEnabled = theme.id === forcedThemeId || theme.forceEnabled || isThemeForceEnabled(theme.id);
           return (
             <ThemeCard
@@ -108,6 +147,36 @@ export function ThemesSettings() {
           );
         })}
       </div>
+
+      {cards.length > COLLAPSED_THEME_COUNT && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="mt-3 text-xs"
+          aria-expanded={!collapsed}
+          data-testid="themes-show-all"
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {collapsed ? <ChevronDown className="w-3.5 h-3.5 me-1" /> : <ChevronUp className="w-3.5 h-3.5 me-1" />}
+          {collapsed ? t('show_all', { count: cards.length }) : t('show_fewer')}
+        </Button>
+      )}
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <div data-search-label={t('title')} className="py-3">
+        <div className="text-sm font-medium text-foreground">{t('title')}</div>
+        <p className="text-xs text-muted-foreground mt-1 mb-3">{t('description')}</p>
+        {grid}
+      </div>
+    );
+  }
+
+  return (
+    <SettingsSection title={t('title')} description={t('description')}>
+      {grid}
     </SettingsSection>
   );
 }
@@ -131,6 +200,8 @@ interface ThemeCardProps {
 }
 
 function ThemeCard({ name, author, preview, css, isDark, isDefaultTheme, isActive, isDefault, isForceEnabled, disabled, variants, onActivate }: ThemeCardProps) {
+  const t = useTranslations('settings.themes');
+  const tVariant = useTranslations('settings.appearance.theme');
   const colors = resolveThemeColors({ css, variants, isDark: !!isDark, isDefaultTheme: !!isDefaultTheme });
   return (
     <div data-search-label={name} className="relative">
@@ -162,12 +233,12 @@ function ThemeCard({ name, author, preview, css, isDark, isDefaultTheme, isActiv
             <span className="text-sm font-medium text-foreground truncate">{name}</span>
             <div className="flex items-center gap-1 flex-shrink-0">
               {isForceEnabled && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 font-medium flex items-center gap-0.5" title="Admin enforced">
+                <span className="text-[0.625rem] px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 font-medium flex items-center gap-0.5" title={t('admin_enforced')}>
                   <Lock className="w-2.5 h-2.5" />
                 </span>
               )}
               {isDefault && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary font-medium">Default</span>
+                <span className="text-[0.625rem] px-1.5 py-0.5 rounded bg-primary/10 text-primary font-medium">{t('default_badge')}</span>
               )}
               {isActive && <Check className="w-4 h-4 text-primary" />}
             </div>
@@ -176,8 +247,8 @@ function ThemeCard({ name, author, preview, css, isDark, isDefaultTheme, isActiv
           {variants && (
             <div className="flex gap-1 mt-1">
               {variants.map(v => (
-                <span key={v} className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
-                  {v}
+                <span key={v} className="text-[0.625rem] px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
+                  {tVariant(v)}
                 </span>
               ))}
             </div>

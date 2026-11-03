@@ -1,7 +1,7 @@
 import { addDays, differenceInCalendarDays, parseISO, startOfDay, subMilliseconds } from "date-fns";
 import { parseDuration } from "@/components/calendar/event-card";
 import type { CalendarEvent } from "@/lib/jmap/types";
-import { toDisplayDate } from "@/lib/timezone";
+import { fromWallClock, isValidTimeZone, parseLocalDateTime, toDisplayDate } from "@/lib/timezone";
 
 export interface CalendarWeekSegment {
   event: CalendarEvent;
@@ -30,7 +30,7 @@ export interface TimedEventLayout {
  * with `fromDisplayDate` before turning grid positions into instants.
  */
 export function getEventStartDate(
-  event: Pick<CalendarEvent, 'start' | 'utcStart' | 'showWithoutTime'>,
+  event: Pick<CalendarEvent, 'start' | 'utcStart' | 'showWithoutTime'> & Partial<Pick<CalendarEvent, 'timeZone'>>,
 ): Date {
   // Prefer utcStart for timed events but fall back to start if utcStart is
   // missing or unparseable - a malformed utcStart used to surface as an
@@ -38,6 +38,12 @@ export function getEventStartDate(
   if (!event.showWithoutTime && event.utcStart) {
     const utc = parseISO(event.utcStart);
     if (!isNaN(utc.getTime())) return toDisplayDate(utc);
+  }
+  // CalendarEvent/parse (.ics import, invitations) returns no utcStart: read
+  // `start` as the wall clock in the event's own zone, not the user's (#1252).
+  if (!event.showWithoutTime && event.timeZone && isValidTimeZone(event.timeZone)) {
+    const wall = event.start ? parseLocalDateTime(event.start) : null;
+    if (wall) return toDisplayDate(fromWallClock(wall, event.timeZone));
   }
   return parseISO(event.start);
 }
@@ -96,6 +102,10 @@ export function getEventDayBounds(event: CalendarEvent): { startDay: Date; endDa
   };
 }
 
+function wallClockMinutes(date: Date): number {
+  return date.getHours() * 60 + date.getMinutes() + date.getSeconds() / 60 + date.getMilliseconds() / 60000;
+}
+
 export function getTimedEventBoundsForDay(
   event: CalendarEvent,
   day: Date,
@@ -111,10 +121,13 @@ export function getTimedEventBoundsForDay(
     return null;
   }
 
-  const clippedStart = eventStart > dayStart ? eventStart : dayStart;
-  const clippedEnd = eventEnd < nextDayStart ? eventEnd : nextDayStart;
-  const startMinutes = Math.max(0, Math.floor((clippedStart.getTime() - dayStart.getTime()) / 60000));
-  const endMinutes = Math.min(1440, Math.ceil((clippedEnd.getTime() - dayStart.getTime()) / 60000));
+  // Wall-clock minutes, not elapsed time since midnight: on a DST change day
+  // the day has 23 or 25 hours, and elapsed time would shift every event
+  // after the change by an hour.
+  const startMinutes = eventStart > dayStart ? Math.floor(wallClockMinutes(eventStart)) : 0;
+  const endMinutes = eventEnd < nextDayStart
+    ? Math.max(startMinutes, Math.ceil(wallClockMinutes(eventEnd)))
+    : 1440;
 
   return {
     startMinutes,
@@ -175,46 +188,42 @@ export function buildWeekSegments(events: CalendarEvent[], weekDays: Date[]): Ca
   return packWeekSegments(buildWeekSegmentsRaw(events, weekDays));
 }
 
+/**
+ * Segments for timed events that cover whole days (midnight to midnight)
+ * within `weekDays`, which must be consecutive days. The days an event
+ * covers in full always form one run, so each event is resolved from its
+ * own bounds instead of being tested against every day - the freely
+ * scrolling views hand in months of days at a time (#759).
+ */
 export function buildTimedFullDayWeekSegments(events: CalendarEvent[], weekDays: Date[]): CalendarWeekSegment[] {
   if (weekDays.length === 0) return [];
 
+  const firstDay = startOfDay(weekDays[0]);
+  const lastDay = startOfDay(weekDays[weekDays.length - 1]);
+
   const rawSegments = events.flatMap((event) => {
-    const fullDayIndices = weekDays
-      .map((day, index) => (isTimedEventFullDayOnDate(event, day) ? index : -1))
-      .filter((index) => index >= 0);
+    if (event.showWithoutTime) return [];
+    const eventStart = getEventStartDate(event);
+    const eventEnd = getEventEndDate(event);
+    const startDay = startOfDay(eventStart);
+    // First day whose midnight is not before the event, last day whose next
+    // midnight is not after it.
+    const firstFull = eventStart.getTime() === startDay.getTime() ? startDay : addDays(startDay, 1);
+    const lastFull = addDays(startOfDay(eventEnd), -1);
+    if (lastFull < firstFull) return [];
 
-    if (fullDayIndices.length === 0) {
-      return [];
-    }
+    const segmentStart = firstFull < firstDay ? firstDay : firstFull;
+    const segmentEnd = lastFull > lastDay ? lastDay : lastFull;
+    if (segmentStart > segmentEnd) return [];
 
-    const segments: CalendarWeekSegment[] = [];
-    let rangeStart = fullDayIndices[0];
-    let previousIndex = fullDayIndices[0];
-
-    const pushSegment = (startIndex: number, endIndex: number) => {
-      const startDay = weekDays[startIndex];
-      const endDay = weekDays[endIndex];
-      segments.push({
-        event,
-        startIndex,
-        span: endIndex - startIndex + 1,
-        row: -1,
-        continuesBefore: isTimedEventFullDayOnDate(event, addDays(startDay, -1)),
-        continuesAfter: isTimedEventFullDayOnDate(event, addDays(endDay, 1)),
-      });
-    };
-
-    for (let index = 1; index < fullDayIndices.length; index++) {
-      const currentIndex = fullDayIndices[index];
-      if (currentIndex !== previousIndex + 1) {
-        pushSegment(rangeStart, previousIndex);
-        rangeStart = currentIndex;
-      }
-      previousIndex = currentIndex;
-    }
-
-    pushSegment(rangeStart, previousIndex);
-    return segments;
+    return [{
+      event,
+      startIndex: differenceInCalendarDays(segmentStart, firstDay),
+      span: differenceInCalendarDays(segmentEnd, segmentStart) + 1,
+      row: -1,
+      continuesBefore: firstFull < segmentStart,
+      continuesAfter: lastFull > segmentEnd,
+    } satisfies CalendarWeekSegment];
   });
 
   return packWeekSegments(rawSegments);

@@ -2,37 +2,74 @@
 
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, useId } from "react";
 import { createPortal } from "react-dom";
-import { Check, Plus, LogOut, Star, ChevronDown, AlertCircle, GripVertical, X } from "lucide-react";
+import { Check, Plus, LogOut, Mails, Star, ChevronDown, AlertCircle, GripVertical, X, Settings, Cloud } from "@/components/icons";
 import { useTranslations } from "next-intl";
+import type { Mailbox } from "@/lib/jmap/types";
 import { useAccountStore, type AccountEntry } from "@/stores/account-store";
 import { useAuthStore } from "@/stores/auth-store";
-import { getMaxAccounts, sortDefaultFirst, reorderNonDefaultIds } from "@/lib/account-utils";
+import { useEmailStore } from "@/stores/email-store";
+import { useSettingsStore } from "@/stores/settings-store";
+import { HelpMenuItems } from "@/components/layout/help-links";
+import { getMaxAccounts, sortDefaultFirst, reorderNonDefaultIds, accountRowText } from "@/lib/account-utils";
+import { inboxUnread, totalInboxUnread } from "@/lib/account-inbox-unread";
 import { isDocumentRTL } from "@/i18n/direction";
-import { cn } from "@/lib/utils";
+import { cn, formatFileSize } from "@/lib/utils";
 import { useRouter } from "@/i18n/navigation";
 import { Avatar } from "@/components/ui/avatar";
 import { useMenuNavigation } from "@/hooks/use-menu-navigation";
+import { useConfirmDialog } from "@/hooks/use-confirm-dialog";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { IconButton } from "@/components/ui/icon-button";
+import { toUnicodeDomain, toUnicodeEmail } from "@/lib/idn";
 
 interface AccountSwitcherProps {
   /** "rail" = small avatar only (NavigationRail), "expanded" = avatar + name + email (Sidebar) */
-  variant?: "rail" | "expanded";
+  variant?: "rail" | "expanded" | "header";
   className?: string;
+  /**
+   * Mountain View only: opens the one list that spans every account. It sits
+   * at the head of the account popover, above the addresses it merges,
+   * because it is the alternative to picking one of them. Omitted when the
+   * unified view is off or out of reach, and then no row is drawn.
+   */
+  onSelectAllInboxes?: () => void;
+  /** Whether that merged list is the one currently on screen. */
+  allInboxesSelected?: boolean;
 }
 
-function AccountAvatar({ account, size = "sm" }: { account: AccountEntry; size?: "sm" | "md" }) {
+function AccountAvatar({ account, size = "sm" }: { account: AccountEntry; size?: "sm" | "md" | "xl" }) {
   return (
     <Avatar
       name={account.displayName || account.label}
       email={account.email || account.username}
       size="sm"
-      className={cn("flex-shrink-0", size === "md" && "w-9 h-9 text-sm")}
+      className={cn(
+        "flex-shrink-0",
+        size === "md" && "w-9 h-9 text-sm",
+        size === "xl" && "!w-20 !h-20 !text-2xl"
+      )}
       disableFavicon
       fallbackColor={account.avatarColor}
     />
   );
 }
 
-export function AccountSwitcher({ variant = "rail", className }: AccountSwitcherProps) {
+/** The popover's unread badge: a count, capped, or nothing at all when there is none. */
+function UnreadBadge({ count }: { count: number | undefined }) {
+  if (!count) return null;
+  return (
+    <span className="ms-auto shrink-0 text-xs font-medium tabular-nums text-primary">
+      {count > 999 ? "999+" : count}
+    </span>
+  );
+}
+
+export function AccountSwitcher({
+  variant = "rail",
+  className,
+  onSelectAllInboxes,
+  allInboxesSelected = false,
+}: AccountSwitcherProps) {
   const t = useTranslations("sidebar");
   const router = useRouter();
   const [open, setOpen] = useState(false);
@@ -49,6 +86,15 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
     triggerRef: buttonRef,
   });
 
+  // The header avatar is Mountain View's account control; the same component
+  // in the rail and the sidebar keeps the list it has always had, so the
+  // default layout is untouched.
+  const mvPopover = useSettingsStore((s) => s.interfaceLayout === "mountain-view") && variant === "header";
+  const accountMailboxes = useEmailStore((s) => s.accountMailboxes);
+  const quota = useEmailStore((s) => s.quota);
+  const tCommon = useTranslations("common");
+  const ownMailboxes = useEmailStore((s) => s.mailboxes);
+
   const accounts = useAccountStore((s) => s.accounts);
   const setDefaultAccount = useAccountStore((s) => s.setDefaultAccount);
   const reorderAccounts = useAccountStore((s) => s.reorderAccounts);
@@ -61,12 +107,26 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
   const logout = useAuthStore((s) => s.logout);
   const removeAccount = useAuthStore((s) => s.removeAccount);
   const logoutAll = useAuthStore((s) => s.logoutAll);
+  const { dialogProps: confirmDialogProps, confirm } = useConfirmDialog();
 
   const updatePosition = useCallback(() => {
     if (!buttonRef.current) return;
     const rect = buttonRef.current.getBoundingClientRect();
     const rtl = isDocumentRTL();
-    if (variant === "rail") {
+    if (variant === "header") {
+      // Anchored at the inline-end edge of the top bar, so the menu drops
+      // down and is pinned by its own trailing edge — anchoring by the
+      // leading edge (as "expanded" does) runs it off-screen, which is
+      // exactly what happened in RTL where that edge is the left one.
+      setPopoverStyle({
+        position: "fixed",
+        top: rect.bottom + 4,
+        maxWidth: "calc(100vw - 16px)",
+        ...(rtl
+          ? { left: Math.max(8, rect.left) }
+          : { right: Math.max(8, window.innerWidth - rect.right) }),
+      });
+    } else if (variant === "rail") {
       setPopoverStyle(
         rtl
           ? {
@@ -135,11 +195,18 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
     router.push(`/login?mode=add-account` as never);
   };
 
-  const handleRemove = (e: React.MouseEvent, account: AccountEntry) => {
+  const handleRemove = async (e: React.MouseEvent, account: AccountEntry) => {
     e.stopPropagation();
-    const label = account.email || account.username;
-    if (!window.confirm(t("remove_account_confirm", { account: label }))) return;
-    removeAccount(account.id);
+    const label = toUnicodeEmail(account.email || account.username);
+    // The popover closes first: the dialog is the only thing asking now.
+    setOpen(false);
+    const ok = await confirm({
+      title: t("remove_account_title"),
+      message: t("remove_account_confirm", { account: label }),
+      confirmText: t("remove_account"),
+      variant: "destructive",
+    });
+    if (ok) removeAccount(account.id);
   };
 
   const handleLogout = () => {
@@ -173,6 +240,20 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
     e.dataTransfer.dropEffect = "move";
     if (overId !== dragOverId) setDragOverId(overId);
   };
+  // Alt+Shift+↑ / ↓ on an account moves it, as dragging does (WCAG 2.1.1);
+  // Settings > Accounts has Move up / Move down buttons for the same order.
+  const handleMoveKey = (e: React.KeyboardEvent, accountId: string) => {
+    if (!e.altKey || !e.shiftKey || (e.key !== "ArrowUp" && e.key !== "ArrowDown")) return;
+    const movable = displayAccounts.filter((a) => !a.isDefault);
+    const index = movable.findIndex((a) => a.id === accountId);
+    const other = movable[index + (e.key === "ArrowUp" ? -1 : 1)];
+    if (index < 0 || !other) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const next = reorderNonDefaultIds(accounts, accountId, other.id);
+    if (next) reorderAccounts(next);
+  };
+
   const handleDrop = (e: React.DragEvent, overId: string) => {
     e.preventDefault();
     if (dragId) {
@@ -185,8 +266,29 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
   // Show the account's own identity, not the preferred sending identity -
   // primaryIdentity can be an alias (e.g. info@korazo.net) that differs from
   // the actually logged-in account (info@linusrath.de).
-  const displayName = activeAccount?.displayName || activeAccount?.label || "";
-  const displayEmail = activeAccount?.email || activeAccount?.username || "";
+  // IDN domains arrive in their ASCII (xn--) form; show them as written (#1100).
+  // A name another account shares gives way to the address (accountRowText).
+  const activeText = activeAccount ? accountRowText(activeAccount, accounts) : null;
+  const displayName = toUnicodeEmail(activeText?.title || "");
+  const displaySubtitle = toUnicodeEmail(activeText?.subtitle || "");
+  const displayEmail = toUnicodeEmail(activeAccount?.email || activeAccount?.username || "");
+
+  // Mountain View leads its popover with the account you are already in - large avatar,
+  // name, address - and lists only the others underneath, since choosing one is
+  // the point of opening it. Every row carries the unread waiting there, so the
+  // choice can be made without visiting each account in turn.
+  const listedAccounts = mvPopover
+    ? displayAccounts.filter((account) => account.id !== activeAccountId)
+    : displayAccounts;
+  const unreadByAccount: Record<string, Mailbox[] | undefined> = activeAccountId
+    ? { ...accountMailboxes, [activeAccountId]: ownMailboxes }
+    : accountMailboxes;
+  const unreadFor = (account: AccountEntry) =>
+    mvPopover ? inboxUnread(unreadByAccount[account.id]) : undefined;
+  const allInboxesUnread = totalInboxUnread(
+    accounts.filter((account) => account.isConnected).map((account) => account.id),
+    unreadByAccount
+  );
 
   return (
     <>
@@ -196,13 +298,15 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
         data-testid="account-switcher"
         data-active-account-id={activeAccountId ?? undefined}
         className={cn(
-          "flex items-center gap-2 rounded-md transition-colors",
-          variant === "rail"
-            ? "justify-center w-10 h-10 hover:bg-muted"
+          // Round under Mountain View, like every other button in its top bar.
+          "flex items-center gap-2 transition-colors",
+          mvPopover ? "rounded-full" : "rounded-md",
+          variant !== "expanded"
+            ? "justify-center w-10 h-10 pointer-coarse:w-11 pointer-coarse:h-11 hover:bg-muted"
             : "w-full px-2 py-1.5 hover:bg-muted text-start min-w-0",
           className
         )}
-        title={variant === "rail" ? (displayName || displayEmail) : undefined}
+        title={variant !== "expanded" ? displayName : undefined}
         aria-label={t("switch_account")}
         aria-expanded={open}
         aria-haspopup="menu"
@@ -210,12 +314,12 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
       >
         {activeAccount ? (
           <>
-            <AccountAvatar account={activeAccount} size={variant === "rail" ? "sm" : "md"} />
+            <AccountAvatar account={activeAccount} size={variant === "expanded" ? "md" : "sm"} />
             {variant === "expanded" && (
               <>
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium text-foreground truncate">{displayName}</p>
-                  <p className="text-xs text-muted-foreground truncate">{displayEmail}</p>
+                  {displaySubtitle && <p className="text-xs text-muted-foreground truncate">{displaySubtitle}</p>}
                 </div>
                 <ChevronDown className={cn("w-3.5 h-3.5 text-muted-foreground flex-shrink-0 transition-transform", open && "rotate-180")} />
               </>
@@ -224,7 +328,7 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
         ) : (
           <div className={cn(
             "rounded-full bg-muted flex items-center justify-center text-muted-foreground",
-            variant === "rail" ? "w-8 h-8 text-xs" : "w-9 h-9 text-sm"
+            variant === "expanded" ? "w-9 h-9 text-sm" : "w-8 h-8 text-xs"
           )}>
             ?
           </div>
@@ -235,17 +339,78 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
         <div
           ref={popoverRef}
           style={popoverStyle}
-          className="w-72 rounded-lg border border-border bg-background text-foreground shadow-lg z-50 overflow-hidden"
+          className={cn(
+            "text-foreground shadow-lg z-50 overflow-hidden",
+            // Width and radius come from the layout's own tokens, keyed on the
+            // attribute below. Under Mountain View it is Gmail's tinted card
+            // holding a white one, with a close button in the corner.
+            mvPopover ? "shadow-xl bg-[var(--mv-search-bg)] p-3 max-h-[calc(100dvh-5rem)] overflow-y-auto" : "w-72 rounded-lg border border-border bg-background"
+          )}
+          data-mv-account-popover={mvPopover ? "" : undefined}
           role="menu"
           id={menuId}
           aria-label={t("switch_account")}
           onKeyDown={handleMenuKeyDown}
         >
-          {/* Account List */}
-          <div className="py-1 max-h-64 overflow-y-auto">
-            {displayAccounts.map((account) => {
+          {mvPopover && (
+            <div className="flex justify-end pb-2">
+              <button
+                type="button"
+                onClick={() => setOpen(false)}
+                className="grid h-9 w-9 place-items-center rounded-full text-muted-foreground hover:bg-foreground/10 hover:text-foreground"
+                aria-label={tCommon("close")}
+                title={tCommon("close")}
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+          )}
+
+          {mvPopover && activeAccount && (
+            <div className="flex items-center gap-4 rounded-t-3xl bg-background px-4 pt-4 pb-3" data-mv-account-current="">
+              <AccountAvatar account={activeAccount} size="xl" />
+              <div className="min-w-0 flex-1">
+                <p className="text-lg leading-6 truncate">{displayName}</p>
+                {displaySubtitle && <p className="text-sm text-muted-foreground truncate">{displaySubtitle}</p>}
+              </div>
+            </div>
+          )}
+
+          {mvPopover && onSelectAllInboxes && (
+            <div className="bg-background border-t border-border/60">
+              <button
+                type="button"
+                role="menuitem"
+                data-testid="all-inboxes"
+                onClick={() => {
+                  setOpen(false);
+                  onSelectAllInboxes();
+                }}
+                className={cn(
+                  "w-full flex items-center gap-3 px-4 py-3 text-start text-sm transition-colors",
+                  allInboxesSelected ? "bg-accent/50 font-medium" : "hover:bg-muted"
+                )}
+              >
+                <Mails className="w-4 h-4 flex-shrink-0 text-muted-foreground" />
+                <span className="truncate">{t("unified_inbox")}</span>
+                <UnreadBadge count={allInboxesUnread} />
+              </button>
+            </div>
+          )}
+
+          {/* Account List. Under Mountain View the active account is already the
+              card above, so with a single login there is no list to draw. */}
+          <div
+            className={cn(
+              "py-1 max-h-64 overflow-y-auto",
+              mvPopover && "bg-background border-t border-border/60 max-h-none",
+              mvPopover && listedAccounts.length === 0 && "hidden"
+            )}
+          >
+            {listedAccounts.map((account) => {
               const isActive = account.id === activeAccountId;
               const isDraggable = !account.isDefault && accounts.length > 2;
+              const text = accountRowText(account, accounts);
               return (
                 <div
                   key={account.id}
@@ -262,13 +427,15 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
                 >
                 <button
                   onClick={() => handleSwitch(account.id)}
+                  onKeyDown={isDraggable ? (e) => handleMoveKey(e, account.id) : undefined}
+                  aria-keyshortcuts={isDraggable ? "Alt+Shift+ArrowUp Alt+Shift+ArrowDown" : undefined}
                   data-testid="account-option"
                   data-account-id={account.id}
                   data-account-email={account.email || account.username}
                   className={cn(
                     "w-full flex items-start gap-3 px-3 py-2.5 text-start transition-colors",
                     isActive ? "bg-accent/50" : "hover:bg-muted",
-                    (!isActive && !account.isDefault) ? (isDraggable ? "pe-14" : "pe-8") : (isDraggable && "pe-7")
+                    (!isActive && !account.isDefault) ? (isDraggable ? "pe-16" : "pe-10") : (isDraggable && "pe-7")
                   )}
                   role="menuitem"
                   disabled={isActive}
@@ -276,7 +443,7 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
                   <div className="relative flex-shrink-0">
                     <AccountAvatar account={account} size="md" />
                     {isActive && (
-                      <div className="absolute -bottom-0.5 -right-0.5 w-4 h-4 rounded-full bg-primary flex items-center justify-center">
+                      <div className="absolute -bottom-0.5 -end-0.5 w-4 h-4 rounded-full bg-primary flex items-center justify-center">
                         <Check className="w-2.5 h-2.5 text-primary-foreground" />
                       </div>
                     )}
@@ -284,16 +451,21 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1">
                       <span className="text-sm font-medium truncate">
-                        {account.displayName || account.label}
+                        {toUnicodeEmail(text.title)}
                       </span>
                       {account.isDefault && (
                         <Star className="w-3 h-3 text-amber-500 flex-shrink-0 fill-amber-500" />
                       )}
+                      <UnreadBadge count={unreadFor(account)} />
                     </div>
-                    <p className="text-xs text-muted-foreground truncate">
-                      {account.email || account.username}
-                    </p>
-                    <div className="flex items-center gap-1 mt-0.5">
+                    {text.subtitle && (
+                      <p className="text-xs text-muted-foreground truncate">
+                        {toUnicodeEmail(text.subtitle)}
+                      </p>
+                    )}
+                    {/* Server and connection state: Mountain View keeps the line
+                        only for an account in trouble. */}
+                    <div className={cn("flex items-center gap-1 mt-0.5", mvPopover && !account.hasError && "hidden")}>
                       {account.hasError ? (
                         <AlertCircle className="w-3 h-3 text-destructive" />
                       ) : (
@@ -302,8 +474,8 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
                           account.isConnected ? "bg-green-500" : "bg-muted-foreground/40"
                         )} />
                       )}
-                      <span className="text-[10px] text-muted-foreground truncate">
-                        {(() => { try { return new URL(account.serverUrl).hostname; } catch { return account.serverUrl; } })()}
+                      <span className="text-[0.625rem] text-muted-foreground truncate">
+                        {(() => { try { return toUnicodeDomain(new URL(account.serverUrl).hostname); } catch { return account.serverUrl; } })()}
                       </span>
                     </div>
                   </div>
@@ -311,35 +483,110 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
                 {isDraggable && (
                   <span
                     aria-hidden
-                    className="pointer-events-none absolute end-7 top-1/2 -translate-y-1/2 text-muted-foreground/50 opacity-0 transition-opacity group-hover/acct:opacity-100"
+                    className={cn(
+                      "pointer-events-none absolute top-1/2 -translate-y-1/2 text-muted-foreground/50 opacity-0 transition-opacity group-hover/acct:opacity-100",
+                      !isActive && !account.isDefault ? "end-10" : "end-1.5"
+                    )}
                   >
                     <GripVertical className="w-4 h-4" />
                   </span>
                 )}
                 {!isActive && !account.isDefault && (
-                  <button
-                    type="button"
-                    onClick={(e) => handleRemove(e, account)}
+                  // Shown on hover and focus, and always on a touch screen (R7).
+                  <IconButton
+                    onClick={(e) => void handleRemove(e, account)}
                     role="menuitem"
-                    aria-label={t("remove_account")}
-                    title={t("remove_account")}
-                    className="absolute end-1.5 top-1/2 -translate-y-1/2 p-1 rounded-md text-muted-foreground/60 opacity-0 transition-opacity group-hover/acct:opacity-100 hover:bg-destructive/10 hover:text-destructive focus:opacity-100 focus:outline-none focus:ring-1 focus:ring-destructive"
+                    label={t("remove_account")}
+                    className="absolute end-1.5 top-1/2 -translate-y-1/2 text-muted-foreground opacity-0 transition-opacity group-hover/acct:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100 hover:bg-destructive/10 hover:text-destructive"
                   >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
+                    <X />
+                  </IconButton>
                 )}
                 </div>
               );
             })}
           </div>
 
+          {/* Mountain View: the account actions as rows closing the white card,
+              then "Manage your account" and the storage in use as pills under it. */}
+          {mvPopover && (
+            <>
+              <div className="rounded-b-3xl bg-background border-t border-border/60 py-1" data-mv-account-actions="">
+                {accounts.length < getMaxAccounts() && (
+                  <button
+                    onClick={handleAddAccount}
+                    data-testid="add-account"
+                    className="w-full flex items-center gap-4 px-5 py-3 text-sm text-start hover:bg-muted transition-colors"
+                    role="menuitem"
+                  >
+                    <Plus className="w-5 h-5 text-muted-foreground" />
+                    {t("mv_add_another_account")}
+                  </button>
+                )}
+                {activeAccount && !activeAccount.isDefault && accounts.length > 1 && (
+                  <button
+                    onClick={() => handleSetDefault(activeAccount.id)}
+                    className="w-full flex items-center gap-4 px-5 py-3 text-sm text-start hover:bg-muted transition-colors"
+                    role="menuitem"
+                  >
+                    <Star className="w-5 h-5 text-muted-foreground" />
+                    {t("set_as_default")}
+                  </button>
+                )}
+                {accounts.length > 1 && (
+                  <button
+                    onClick={handleLogout}
+                    className="w-full flex items-center gap-4 px-5 py-3 text-sm text-start hover:bg-muted transition-colors"
+                    role="menuitem"
+                  >
+                    <LogOut className="w-5 h-5 text-muted-foreground" />
+                    <span className="truncate">{t("sign_out_of", { account: displayEmail })}</span>
+                  </button>
+                )}
+                <button
+                  onClick={accounts.length > 1 ? handleLogoutAll : handleLogout}
+                  className="w-full flex items-center gap-4 px-5 py-3 text-sm text-start hover:bg-muted transition-colors"
+                  role="menuitem"
+                >
+                  <LogOut className="w-5 h-5 text-muted-foreground" />
+                  {accounts.length > 1 ? t("sign_out_all") : t("sign_out")}
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => { setOpen(false); router.push("/settings" as never); }}
+                className="mt-2 w-full flex items-center gap-4 rounded-full bg-background px-5 py-3 text-sm text-start hover:bg-muted transition-colors"
+                role="menuitem"
+                data-mv-manage-account=""
+              >
+                <Settings className="w-5 h-5 text-muted-foreground" />
+                {t("mv_manage_account")}
+              </button>
+              {quota && quota.total > 0 && (
+                <div className="mt-2 flex items-center gap-4 rounded-full bg-background px-5 py-3 text-sm" data-mv-storage="">
+                  <Cloud className="w-5 h-5 text-muted-foreground" />
+                  {t("mv_storage_used", {
+                    percent: Math.min(100, Math.round((quota.used / quota.total) * 100)),
+                    total: formatFileSize(quota.total),
+                  })}
+                </div>
+              )}
+              <HelpMenuItems
+                onSelect={() => setOpen(false)}
+                className="mt-2 rounded-3xl bg-background py-1"
+                itemClassName="w-full flex items-center gap-4 px-5 py-3 text-sm text-start hover:bg-muted transition-colors"
+                iconClassName="w-5 h-5 shrink-0 text-muted-foreground"
+              />
+            </>
+          )}
+
           {/* Separator + Add Account */}
-          {accounts.length < getMaxAccounts() && (
+          {!mvPopover && accounts.length < getMaxAccounts() && (
             <div className="border-t border-border">
               <button
                 onClick={handleAddAccount}
                 data-testid="add-account"
-                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-foreground hover:bg-muted transition-colors"
+                className="w-full flex items-center gap-2 px-3 py-2 pointer-coarse:min-h-11 text-sm text-start text-foreground hover:bg-muted transition-colors"
                 role="menuitem"
               >
                 <Plus className="w-4 h-4" />
@@ -348,12 +595,22 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
             </div>
           )}
 
-          {/* Separator + Actions */}
-          <div className="border-t border-border">
+          {/* Accessibility and help links the operator set (lib/help-links.ts). */}
+          {!mvPopover && (
+            <HelpMenuItems
+              onSelect={() => setOpen(false)}
+              className="border-t border-border py-1"
+              itemClassName="w-full flex items-center gap-2 px-3 py-2 pointer-coarse:min-h-11 text-sm text-start text-foreground hover:bg-muted transition-colors"
+            />
+          )}
+
+          {/* Separator + Actions. Under Mountain View a single login signs out
+              from the pill above, so these rows are only for picking among several. */}
+          <div className={cn("border-t border-border", mvPopover && "hidden")}>
             {activeAccount && !activeAccount.isDefault && accounts.length > 1 && (
               <button
                 onClick={() => handleSetDefault(activeAccount.id)}
-                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-foreground hover:bg-muted transition-colors"
+                className={cn("w-full flex items-center gap-2 py-2 pointer-coarse:min-h-11 text-sm text-start text-foreground hover:bg-muted transition-colors", mvPopover ? "px-4" : "px-3")}
                 role="menuitem"
               >
                 <Star className="w-4 h-4" />
@@ -362,16 +619,16 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
             )}
             <button
               onClick={handleLogout}
-              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-foreground hover:bg-muted transition-colors"
+              className={cn("w-full flex items-center gap-2 py-2 pointer-coarse:min-h-11 text-sm text-start text-foreground hover:bg-muted transition-colors", mvPopover ? "px-4" : "px-3")}
               role="menuitem"
             >
               <LogOut className="w-4 h-4" />
               {t("sign_out_of", { account: displayEmail })}
             </button>
-            {accounts.length > 1 && (
+            {!mvPopover && accounts.length > 1 && (
               <button
                 onClick={handleLogoutAll}
-                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-destructive hover:bg-muted transition-colors"
+                className="w-full flex items-center gap-2 px-3 py-2 pointer-coarse:min-h-11 text-sm text-start text-foreground hover:bg-muted transition-colors"
                 role="menuitem"
               >
                 <LogOut className="w-4 h-4" />
@@ -382,6 +639,7 @@ export function AccountSwitcher({ variant = "rail", className }: AccountSwitcher
         </div>,
         document.body
       )}
+      <ConfirmDialog {...confirmDialogProps} />
     </>
   );
 }

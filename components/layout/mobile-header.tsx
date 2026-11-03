@@ -1,11 +1,17 @@
 "use client";
 
-import { Menu, ArrowLeft, Plus, Search, X } from "lucide-react";
+import type { ReactNode } from "react";
+import { Menu, ArrowLeft, Plus, Search, X } from "@/components/icons";
 import { Button } from "@/components/ui/button";
+import { IconButton } from "@/components/ui/icon-button";
 import { useUIStore } from "@/stores/ui-store";
+import { useShallow } from "zustand/react/shallow";
+import { useSettingsStore } from "@/stores/settings-store";
 import { useIsDesktop } from "@/hooks/use-media-query";
 import { cn } from "@/lib/utils";
 import { useTranslations } from "next-intl";
+import { AccountSwitcher } from "@/components/layout/account-switcher";
+import { PhoneHeaderMenu } from "@/components/layout/phone-header-actions";
 
 interface MobileHeaderProps {
   title: string;
@@ -16,6 +22,23 @@ interface MobileHeaderProps {
   className?: string;
   /** Id of the sidebar this header's menu button toggles. */
   sidebarId?: string;
+  /**
+   * When set, the mailbox title is replaced by a tappable search field and
+   * this fires instead. The folder name stays visible in the drawer, so the
+   * bar spends its width on the thing you act on rather than a label.
+   */
+  onOpenSearch?: () => void;
+  /** Placeholder shown inside the search field. */
+  searchPlaceholder?: string;
+  /** Clears the active query without opening the search panel. */
+  onClearSearch?: () => void;
+  /** Whether a query is currently applied, which reveals the clear button. */
+  searchActive?: boolean;
+  /** Mountain View: opens the merged across-accounts inbox from the avatar's popover. */
+  onSelectAllInboxes?: () => void;
+  allInboxesSelected?: boolean;
+  /** The app's entries at the top of the ⋮ menu; `close` shuts the menu. */
+  menuItems?: (close: () => void) => ReactNode;
 }
 
 export function MobileHeader({
@@ -26,9 +49,17 @@ export function MobileHeader({
   onSearch,
   className,
   sidebarId,
+  onOpenSearch,
+  searchPlaceholder,
+  onClearSearch,
+  searchActive = false,
+  onSelectAllInboxes,
+  allInboxesSelected = false,
+  menuItems,
 }: MobileHeaderProps) {
   const t = useTranslations('sidebar');
-  const { toggleSidebar, goBack, sidebarOpen } = useUIStore();
+  const { toggleSidebar, goBack, sidebarOpen } = useUIStore(useShallow((state) => ({ toggleSidebar: state.toggleSidebar, goBack: state.goBack, sidebarOpen: state.sidebarOpen })));
+  const mountainView = useSettingsStore((state) => state.interfaceLayout === 'mountain-view');
   // Pane-aware: in Pro split mode the viewport is desktop-wide while the
   // pane is narrow. The Tailwind `lg:hidden` variant alone would never fire
   // there, so we additionally hide via JS when the surrounding pane is
@@ -48,13 +79,17 @@ export function MobileHeader({
 
   return (
     <header
+      data-mobile-mail-header=""
       className={cn(
-        "flex items-center justify-between px-4 h-14 border-b border-border bg-background shrink-0",
+        "flex items-center justify-between h-14 shrink-0",
+        mountainView
+          ? "mx-2 mt-2 mb-1 rounded-full border-0 bg-muted px-2 shadow-sm"
+          : "border-b border-border bg-background px-4",
         className
       )}
     >
       {/* Left action: Menu or Back button */}
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 min-w-0 flex-shrink-0">
         <Button
           variant="ghost"
           size="icon"
@@ -77,12 +112,45 @@ export function MobileHeader({
           )}
         </Button>
 
-        {/* Title */}
-        <h1 className="font-semibold text-lg truncate">{title}</h1>
+        {/* Title, unless the bar is in search-first mode */}
+        {/* Not a heading: the app's h1 already names the folder ("Inbox – Mail"). */}
+        {!onOpenSearch && <div className="font-semibold text-lg truncate">{title}</div>}
       </div>
 
+      {onOpenSearch && (
+        /* Not a single button: the clear control is a button of its own, and
+           nesting one inside another is invalid markup. */
+        <div
+          data-mobile-mail-search=""
+          data-tour="search-input"
+          className={cn(
+            "flex-1 min-w-0 h-10 flex items-center rounded-full pe-1",
+            mountainView ? "mx-0 bg-transparent ps-2" : "mx-1 bg-muted ps-3"
+          )}
+        >
+          <button
+            type="button"
+            onClick={onOpenSearch}
+            className="flex-1 min-w-0 h-full flex items-center gap-2 text-start text-muted-foreground"
+            aria-label={searchPlaceholder || title}
+          >
+            <Search className="h-4 w-4 flex-shrink-0" />
+            <span className="truncate text-sm">{searchPlaceholder || title}</span>
+          </button>
+          {searchActive && onClearSearch && (
+            <IconButton
+              onClick={onClearSearch}
+              className="flex-shrink-0 rounded-full text-muted-foreground hover:bg-background/60"
+              label={t('clear_search')}
+            >
+              <X />
+            </IconButton>
+          )}
+        </div>
+      )}
+
       {/* Right actions */}
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-1 flex-shrink-0">
         {onSearch && (
           <Button
             variant="ghost"
@@ -105,57 +173,18 @@ export function MobileHeader({
             <Plus className="h-5 w-5" />
           </Button>
         )}
-      </div>
-    </header>
-  );
-}
 
-/**
- * Viewer header for mobile - shows when viewing an email
- */
-interface MobileViewerHeaderProps {
-  subject?: string;
-  onBack: () => void;
-  onDelete?: () => void;
-  onArchive?: () => void;
-  className?: string;
-}
+        <PhoneHeaderMenu menuItems={menuItems} />
 
-export function MobileViewerHeader({
-  subject,
-  onBack,
-  onDelete: _onDelete,
-  onArchive: _onArchive,
-  className,
-}: MobileViewerHeaderProps) {
-  const t = useTranslations('sidebar');
-  const isPaneDesktop = useIsDesktop();
-  if (isPaneDesktop) return null;
-
-  return (
-    <header
-      className={cn(
-        "flex items-center justify-between px-2 h-14 border-b border-border bg-background shrink-0",
-        className
-      )}
-    >
-      <Button
-        variant="ghost"
-        size="icon"
-        onClick={onBack}
-        className="h-11 w-11"
-        aria-label={t('mobile.go_back')}
-      >
-        <ArrowLeft className="h-5 w-5" />
-      </Button>
-
-      <h1 className="flex-1 font-medium text-sm truncate px-2 text-center">
-        {subject || "(No Subject)"}
-      </h1>
-
-      <div className="flex items-center">
-        {/* Placeholder for additional actions - kept minimal */}
-        <div className="w-10" />
+        {/* Which account you are reading is otherwise only visible after
+            opening the drawer. Last in this group so it sits on the far
+            edge — opposite the menu button, and mirrored under RTL because
+            the header is laid out with flex rather than fixed sides. */}
+        <AccountSwitcher
+          variant="header"
+          onSelectAllInboxes={onSelectAllInboxes}
+          allInboxesSelected={allInboxesSelected}
+        />
       </div>
     </header>
   );

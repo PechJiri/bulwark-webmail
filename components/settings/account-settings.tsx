@@ -1,8 +1,8 @@
 "use client";
 
-import { useState, useRef, useCallback, useMemo } from 'react';
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { useTranslations } from 'next-intl';
-import { Check, GripVertical, Plus, Star, AlertCircle, ChevronRight } from 'lucide-react';
+import { Check, GripVertical, Plus, Star, AlertCircle, ChevronRight, ChevronUp, ChevronDown } from '@/components/icons';
 import { useAuthStore } from '@/stores/auth-store';
 import { useEmailStore } from '@/stores/email-store';
 import { useAccountStore, type AccountEntry } from '@/stores/account-store';
@@ -12,11 +12,20 @@ import { SettingsSection, SettingItem } from './settings-section';
 import { Avatar } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { useRouter } from '@/i18n/navigation';
-import { getMaxAccounts } from '@/lib/account-utils';
+import { getMaxAccounts, accountRowText } from '@/lib/account-utils';
 import { formatFileSize, cn } from '@/lib/utils';
+import { toUnicodeDomain, toUnicodeEmail } from '@/lib/idn';
+import { IS_LITE } from '@/lib/lite';
+import { isPasswordSession } from '@/lib/auth/password-session';
+import { usePolicyStore } from '@/stores/policy-store';
+import { AccountArchiveSettings } from './account-archive-settings';
+import { DisplayNameSection } from './account-security-settings';
+import { EmailAddressesSection } from './identity-settings';
+import { MultipleAccountsSection } from './layout-settings';
+import { useAccountSecurityStore } from '@/stores/account-security-store';
 
 function hostnameOf(serverUrl: string): string {
-  try { return new URL(serverUrl).hostname; } catch { return serverUrl; }
+  try { return toUnicodeDomain(new URL(serverUrl).hostname); } catch { return serverUrl; }
 }
 
 // First scoped settings tab to land on for a shared account, by capability.
@@ -37,6 +46,25 @@ export function AccountSettings() {
   const activeAccountId = useAuthStore((s) => s.activeAccountId);
   const switchAccount = useAuthStore((s) => s.switchAccount);
   const setManagedAccount = useManagedAccountStore((s) => s.setManagedAccount);
+  const archiveEnabled = usePolicyStore((s) => s.isFeatureEnabled('accountArchiveEnabled')) && !IS_LITE && !isDemoMode;
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  // The display name is editable on Stalwart (the principal's name) for
+  // password sign-ins; identity-provider and token sessions cannot manage
+  // the principal.
+  const { isStalwart, probe, fetchPrincipal } = useAccountSecurityStore();
+  const activeAccount = useAccountStore((s) => (activeAccountId ? s.getAccountById(activeAccountId) : undefined));
+  const canEditDisplayName = isStalwart === true && isPasswordSession(authMode, activeAccount);
+  // Wait for `client` before probing, as the Security page does: on reload
+  // the persisted session flips authenticated before the client reconnects.
+  useEffect(() => {
+    if (!isAuthenticated || !client) return;
+    if (isStalwart === null) {
+      void probe().then((detected) => { if (detected) void fetchPrincipal(); });
+    } else if (isStalwart) {
+      void fetchPrincipal();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated, client, isStalwart]);
 
   // Shared/group accounts delegated to this session (excludes the user's own
   // primary account). These can be drilled into for scoped settings editing.
@@ -57,7 +85,7 @@ export function AccountSettings() {
   // `account.displayName` is refreshed from the server on every login/restore
   // (Stalwart principal "Full name" when available - #900); the identity name
   // is only a fallback until that entry exists.
-  const displayName = account?.displayName || primaryIdentity?.name || (isDemoMode ? 'Demo User' : undefined);
+  const displayName = account?.displayName || primaryIdentity?.name || (isDemoMode ? 'Nora Lindqvist' : undefined);
   const email = primaryIdentity?.email || account?.email || username;
   const max = getMaxAccounts();
 
@@ -118,33 +146,39 @@ export function AccountSettings() {
 
   return (
     <div className="space-y-8">
-      <SettingsSection title={t('title')} description={t('description')}>
-        {/* Display Name */}
-        <SettingItem label={t('name_label')}>
-          <span className="text-sm text-foreground">{displayName || tCommon('unknown')}</span>
-        </SettingItem>
+      <SettingsSection id="profile" title={t('title')} description={t('description')}>
+        {/* Display Name: editable where the server lets us, read-only otherwise. */}
+        {canEditDisplayName ? (
+          <DisplayNameSection />
+        ) : (
+          <SettingItem label={t('name_label')}>
+            <span className="text-sm text-foreground">{displayName || tCommon('unknown')}</span>
+          </SettingItem>
+        )}
 
         {/* Email Address */}
         <SettingItem label={t('email.label')}>
-          <span className="text-sm text-foreground">{email || tCommon('unknown')}</span>
+          <span dir={email ? 'ltr' : undefined} className="text-sm text-foreground">{email ? toUnicodeEmail(email) : tCommon('unknown')}</span>
         </SettingItem>
 
         {/* Username / Login (show when it differs from email) */}
         {username && username !== email && (
           <SettingItem label={t('username_label')}>
-            <span className="text-sm text-foreground">{username}</span>
+            <span dir="ltr" className="text-sm text-foreground">{toUnicodeEmail(username)}</span>
           </SettingItem>
         )}
 
         {/* Authentication Method */}
         <SettingItem label={t('auth_method_label')}>
           <span className="text-sm text-foreground">
-            {authMode === 'oauth' ? t('auth_method_oauth') : t('auth_method_basic')}
+            {authMode === 'oauth'
+              ? t('auth_method_oauth')
+              : authMode === 'token' ? t('auth_method_token') : t('auth_method_basic')}
           </span>
         </SettingItem>
 
         {/* Server */}
-        <SettingItem label={t('server.label')}>
+        <SettingItem label={t('server.label')} advanced term="jmap">
           <span className="text-sm text-foreground truncate max-w-xs">
             {serverUrl || tCommon('unknown')}
           </span>
@@ -184,14 +218,17 @@ export function AccountSettings() {
         )}
       </SettingsSection>
 
+      <EmailAddressesSection />
+
       {/* Logged-in accounts list */}
       {accounts.length > 0 && (
-        <SettingsSection title={t('accounts.title')} description={t('accounts.description')}>
+        <SettingsSection id="browser" title={t('accounts.title')} description={t('accounts.description')}>
           <div className="space-y-2">
             {accounts.map((a, index) => (
               <AccountRow
                 key={a.id}
                 account={a}
+                text={accountRowText(a, accounts)}
                 index={index}
                 isActive={a.id === activeAccountId}
                 isFirst={index === 0}
@@ -232,10 +269,14 @@ export function AccountSettings() {
         </SettingsSection>
       )}
 
+      {archiveEnabled && <AccountArchiveSettings />}
+
+      <MultipleAccountsSection />
+
       {/* Shared / group accounts delegated to this session. Clicking one drills
           into a scoped settings view (filters, vacation, calendars, contacts). */}
       {sharedAccounts.length > 0 && (
-        <SettingsSection title={t('shared_accounts.title')} description={t('shared_accounts.description')}>
+        <SettingsSection id="shared" title={t('shared_accounts.title')} description={t('shared_accounts.description')}>
           <div className="space-y-2">
             {sharedAccounts.map((acc) => {
               const editable = firstScopedTab(acc.capabilities) !== null;
@@ -275,6 +316,7 @@ export function AccountSettings() {
 
 interface AccountRowProps {
   account: AccountEntry;
+  text: { title: string; subtitle: string | null };
   index: number;
   isActive: boolean;
   isFirst: boolean;
@@ -301,6 +343,7 @@ interface AccountRowProps {
 
 function AccountRow({
   account,
+  text,
   index,
   isActive,
   isFirst,
@@ -367,15 +410,17 @@ function AccountRow({
       >
         <div className="flex items-center gap-1.5">
           <span className="text-sm font-medium truncate">
-            {account.displayName || account.label}
+            {toUnicodeEmail(text.title)}
           </span>
           {account.isDefault && (
             <Star className="w-3 h-3 text-amber-500 flex-shrink-0 fill-amber-500" aria-label={labels.default} />
           )}
         </div>
-        <p className="text-xs text-muted-foreground truncate">
-          {account.email || account.username}
-        </p>
+        {text.subtitle && (
+          <p dir="ltr" className="text-xs text-muted-foreground truncate rtl:text-right">
+            {toUnicodeEmail(text.subtitle)}
+          </p>
+        )}
         <div className="flex items-center gap-1 mt-0.5">
           {account.hasError ? (
             <AlertCircle className="w-3 h-3 text-destructive" />
@@ -385,7 +430,7 @@ function AccountRow({
               account.isConnected ? 'bg-green-500' : 'bg-muted-foreground/40'
             )} />
           )}
-          <span className="text-[10px] text-muted-foreground truncate">
+          <span className="text-[0.625rem] text-muted-foreground truncate">
             {hostnameOf(account.serverUrl)}
           </span>
         </div>
@@ -411,9 +456,7 @@ function AccountRow({
           title={labels.moveUp}
           aria-label={labels.moveUp}
         >
-          <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M4 10l4-4 4 4" />
-          </svg>
+          <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
         </button>
         <button
           type="button"
@@ -423,9 +466,7 @@ function AccountRow({
           title={labels.moveDown}
           aria-label={labels.moveDown}
         >
-          <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M4 6l4 4 4-4" />
-          </svg>
+          <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
         </button>
       </div>
     </div>

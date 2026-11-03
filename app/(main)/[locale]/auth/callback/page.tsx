@@ -1,24 +1,44 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslations } from "next-intl";
 import { useAuthStore } from "@/stores/auth-store";
 import { apiFetch, getPathPrefix, toRouterPath, replaceWindowLocation } from "@/lib/browser-navigation";
 import { buildSettingsPath } from "@/lib/deep-links";
-import { Loader2, AlertCircle } from "lucide-react";
+import { LITE_OAUTH_AVAILABLE, getLiteOAuthRedirectUri } from "@/lib/auth/lite-oauth";
+import { AlertCircle } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import { useParams } from "next/navigation";
+import { buildMobileHandoffUrl, mobileHandoffTarget } from "@/lib/auth/mobile-handoff";
+import { confirmMobileHandoffCodeUrl } from "@/lib/auth/mobile-handoff-client";
+import { MobileHandoffConsent } from "@/components/auth/mobile-handoff-consent";
+import { MailSkeleton } from "@/components/boot-skeleton/mail-skeleton";
+import { useSkeletonLabels } from "@/components/boot-skeleton/use-skeleton-labels";
 
 function OAuthCallbackInner() {
   const router = useRouter();
   const params = useParams();
   const searchParams = useSearchParams();
   const t = useTranslations("login");
+  const { labels } = useSkeletonLabels();
   const { loginWithOAuth, loginWithServerSso } = useAuthStore();
   const [error, setError] = useState<string | null>(null);
+  // A sign-in started for the mobile app, waiting for the user to confirm
+  // the handoff (lib/auth/mobile-handoff.ts).
+  const [pendingHandoff, setPendingHandoff] = useState<{
+    url: string | null;
+    resolveUrl?: () => Promise<string | null>;
+    username: string;
+  } | null>(null);
+  // The authorization code is single-use. React's development double effect
+  // ran this twice: the second pass no longer saw the pairing re-auth flag
+  // (the first had removed it) and spent the code on the login flow instead.
+  const handledRef = useRef(false);
 
   useEffect(() => {
+    if (handledRef.current) return;
+    handledRef.current = true;
     const code = searchParams.get("code");
     const state = searchParams.get("state");
     const errorParam = searchParams.get("error");
@@ -37,9 +57,13 @@ function OAuthCallbackInner() {
     // via prompt=login. Don't create a login session — just confirm the fresh
     // auth (sets the short-lived pairing proof cookie) and bounce back to the
     // Security settings, where the QR generation auto-resumes.
+    // The flag holds the state the step-up started with; one left behind by an
+    // abandoned round trip is dropped here instead of capturing this login.
     let pairReauthResume = false;
     try {
-      pairReauthResume = sessionStorage.getItem("pair_reauth_resume") === "1";
+      const resumeState = sessionStorage.getItem("pair_reauth_resume");
+      pairReauthResume = !!state && resumeState === state;
+      if (resumeState !== null && !pairReauthResume) sessionStorage.removeItem("pair_reauth_resume");
     } catch { /* sessionStorage unavailable */ }
     if (pairReauthResume && state) {
       try { sessionStorage.removeItem("pair_reauth_resume"); } catch { /* ignore */ }
@@ -90,7 +114,11 @@ function OAuthCallbackInner() {
       }
 
       const prefix = getPathPrefix(params.locale as string);
-      const redirectUri = `${window.location.origin}${prefix}/${params.locale}/auth/callback`;
+      // Lite on Stalwart registers one locale-free URI (lib/auth/lite-oauth.ts);
+      // the entry document brought us here from it.
+      const redirectUri = LITE_OAUTH_AVAILABLE
+        ? getLiteOAuthRedirectUri()
+        : `${window.location.origin}${prefix}/${params.locale}/auth/callback`;
 
       loginWithOAuth(serverUrl, code, codeVerifier, redirectUri, serverId)
         .then((success) => {
@@ -120,14 +148,14 @@ function OAuthCallbackInner() {
       // Server-side SSO flow - state was stored in encrypted httpOnly cookie.
       // Branch on mobile handoff first: the login page left a marker in
       // sessionStorage if it kicked this OAuth dance off for the mobile app.
-      let mobileRedirectUri: string | null = null;
+      let mobileRedirectUri = "";
       let mobileState: string | null = null;
       try {
-        mobileRedirectUri = sessionStorage.getItem("mobile_redirect_uri");
+        mobileRedirectUri = mobileHandoffTarget(sessionStorage.getItem("mobile_redirect_uri"));
         mobileState = sessionStorage.getItem("mobile_state");
       } catch { /* sessionStorage may be unavailable */ }
 
-      if (mobileRedirectUri && mobileRedirectUri.startsWith("bulwarkmobile://")) {
+      if (mobileRedirectUri) {
         // Drive /api/auth/sso/complete directly so we can read the tokens
         // out of the response - loginWithServerSso would consume them and
         // wire up the webmail auth store, which isn't useful here. The
@@ -146,6 +174,27 @@ function OAuthCallbackInner() {
               return;
             }
             const data = await res.json();
+            if (typeof data.mobile_handoff_code === "string" && data.mobile_handoff_code) {
+              // The app sent a PKCE challenge: the server kept the tokens and
+              // the link carries only a one-time code (bulwarkmail.org/docs/development/mobile-handoff).
+              // The code starts working when the user confirms.
+              const handoffCode: string = data.mobile_handoff_code;
+              const handoffState = typeof data.mobile_state === "string" ? data.mobile_state : mobileState ?? "";
+              try {
+                sessionStorage.removeItem("mobile_redirect_uri");
+                sessionStorage.removeItem("mobile_state");
+              } catch { /* ignore */ }
+              setPendingHandoff({
+                url: null,
+                resolveUrl: () => confirmMobileHandoffCodeUrl({
+                  target: mobileRedirectUri,
+                  code: handoffCode,
+                  state: handoffState,
+                }),
+                username: typeof data.server_url === "string" ? data.server_url : "",
+              });
+              return;
+            }
             const serverUrl = data.server_url as string | undefined;
             const accessToken = data.access_token as string | undefined;
             const tokenEndpoint = data.token_endpoint as string | undefined;
@@ -172,7 +221,12 @@ function OAuthCallbackInner() {
               sessionStorage.removeItem("mobile_redirect_uri");
               sessionStorage.removeItem("mobile_state");
             } catch { /* ignore */ }
-            window.location.replace(`${mobileRedirectUri}#${fragment.toString()}`);
+            // Shown to the user first; the navigation happens on their confirmation.
+            setPendingHandoff({
+              url: buildMobileHandoffUrl(mobileRedirectUri, Object.fromEntries(fragment)),
+              // The complete route names the account's server, not the user.
+              username: typeof data.username === "string" ? data.username : serverUrl,
+            });
           } catch {
             setError("token_exchange_failed");
           }
@@ -222,6 +276,26 @@ function OAuthCallbackInner() {
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  if (pendingHandoff) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-background via-background to-muted/20">
+        <MobileHandoffConsent
+          url={pendingHandoff.url}
+          resolveUrl={pendingHandoff.resolveUrl ?? null}
+          username={pendingHandoff.username}
+          onError={() => {
+            setPendingHandoff(null);
+            setError("token_exchange_failed");
+          }}
+          onCancel={() => {
+            setPendingHandoff(null);
+            router.push(toRouterPath(`${getPathPrefix(params.locale as string)}/${params.locale}/login`));
+          }}
+        />
+      </div>
+    );
+  }
+
   if (error) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-background via-background to-muted/20">
@@ -252,27 +326,16 @@ function OAuthCallbackInner() {
     );
   }
 
-  return (
-    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-background via-background to-muted/20">
-      <div className="w-full max-w-sm mx-auto px-4 text-center" role="status">
-        <Loader2 className="w-8 h-8 animate-spin text-primary mx-auto mb-4" />
-        <p className="text-muted-foreground text-sm">{t("oauth_completing")}</p>
-      </div>
-    </div>
-  );
+  // A finished sign-in lands in the mailbox (or the page saved before it),
+  // so the mail page's skeleton: it stays in place while the app loads there.
+  return <MailSkeleton label={t("oauth_completing")} labels={labels} />;
 }
 
 export default function OAuthCallbackPage() {
+  const t = useTranslations("login");
+  const { labels } = useSkeletonLabels();
   return (
-    <Suspense
-      fallback={
-        <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-background via-background to-muted/20">
-          <div className="w-full max-w-sm mx-auto px-4 text-center" role="status">
-            <Loader2 className="w-8 h-8 animate-spin text-primary mx-auto mb-4" />
-          </div>
-        </div>
-      }
-    >
+    <Suspense fallback={<MailSkeleton label={t("oauth_completing")} labels={labels} />}>
       <OAuthCallbackInner />
     </Suspense>
   );

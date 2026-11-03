@@ -17,7 +17,21 @@
  * this process — see calendar-agenda's session handling).
  */
 
+import { fetchJmapServer } from '@/lib/stalwart/server-fetch';
+import { UPSTREAM_JSON_MAX_BYTES, readJsonCapped } from '@/lib/security/capped-body';
+import { forwardedClientHeaders } from '@/lib/auth/client-address';
+
 const MAX_REDIRECTS = 3;
+
+/**
+ * `trusted` mirrors `StalwartCredentials.trusted`: pass `false` for a
+ * user-chosen server so the request goes through the rebinding-safe fetch.
+ */
+export interface JmapFetchOptions {
+  trusted?: boolean;
+  /** Address of the browser behind the request, see lib/auth/client-address.ts. */
+  clientIp?: string;
+}
 
 export interface JmapSessionDocument {
   apiUrl?: string;
@@ -51,18 +65,20 @@ export async function postJmap(
   apiUrl: string,
   authHeader: string,
   body: string,
+  options: JmapFetchOptions = {},
 ): Promise<Response> {
   let url = new URL(apiUrl);
   for (let attempt = 0; attempt <= MAX_REDIRECTS; attempt++) {
-    const response = await fetch(url, {
+    const response = await fetchJmapServer(url.toString(), {
       method: 'POST',
       headers: {
         'Authorization': authHeader,
         'Content-Type': 'application/json',
+        ...forwardedClientHeaders(options.clientIp),
       },
       body,
       redirect: 'manual',
-    });
+    }, options.trusted);
 
     if (response.status < 300 || response.status >= 400) {
       return response;
@@ -91,17 +107,19 @@ export async function postJmap(
 export async function fetchJmapSession(
   serverUrl: string,
   authHeader: string,
+  options: JmapFetchOptions = {},
 ): Promise<JmapSessionDocument | null> {
   const candidates = [`${serverUrl}/jmap/session`, `${serverUrl}/.well-known/jmap`];
   for (const url of candidates) {
     try {
-      const res = await fetch(url, {
+      const res = await fetchJmapServer(url, {
         method: 'GET',
-        headers: { Authorization: authHeader },
+        headers: { Authorization: authHeader, ...forwardedClientHeaders(options.clientIp) },
         redirect: 'follow',
-      });
+      }, options.trusted);
       if (!res.ok) continue;
-      const session = (await res.json()) as JmapSessionDocument;
+      // An oversized session throws here, and the next candidate is tried.
+      const session = await readJsonCapped<JmapSessionDocument>(res, UPSTREAM_JSON_MAX_BYTES);
       if (session && typeof session === 'object' && session.primaryAccounts) {
         return session;
       }

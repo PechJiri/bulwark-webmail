@@ -1,64 +1,206 @@
 import { describe, it, expect } from 'vitest';
 import {
-  toWildcardQuery,
   buildJMAPFilter,
   isFilterEmpty,
   activeFilterCount,
+  splitSearchText,
+  textConditions,
+  textFilter,
+  normalizePluginFilter,
   DEFAULT_SEARCH_FILTERS,
 } from '../jmap/search-utils';
 import type { SearchFilters } from '../jmap/search-utils';
 
+type Filter = Record<string, unknown>;
+
+describe('normalizePluginFilter', () => {
+  // Plugin search.run and tab queries share this check: Stalwart 1.0 panics
+  // on JMAP Metadata filter conditions.
+  it('rejects JMAP Metadata conditions in a plugin search', () => {
+    expect(() => normalizePluginFilter('search.run: query', {
+      operator: 'AND',
+      conditions: [{ from: 'a@example.com' }, { privateMetadataTextContains: 'x' }],
+    })).toThrow('search.run: query may not filter on JMAP Metadata ("privateMetadataTextContains")');
+    expect(normalizePluginFilter('search.run: query', { from: 'a@example.com' })).toEqual({ from: 'a@example.com' });
+  });
+});
+
+/** Stalwart rejects a filter object with both `operator` and property keys. */
+function expectNoMixedKeys(filter: Filter): void {
+  if ('operator' in filter) {
+    expect(Object.keys(filter).sort()).toEqual(['conditions', 'operator']);
+    for (const c of filter.conditions as Filter[]) expectNoMixedKeys(c);
+  } else {
+    expect(filter).not.toHaveProperty('conditions');
+  }
+}
+
 // ---------------------------------------------------------------------------
-// toWildcardQuery
+// A small model of Email/query text conditions on Stalwart's built-in index,
+// so the tests can check what a filter finds on each version, not only its
+// shape. It leaves out stemming and language detection.
+// - 1.0 (store/src/search/document.rs `has_text`): a value wrapped in `"` or
+//   `'` is an exact phrase (word positions exist for subject and body only;
+//   address fields fall back to all words); a value ending in `*` is one
+//   prefix over the rest, lower-cased and not split into words, at most 16
+//   bytes, matching words of at most 16 bytes; anything else needs all its
+//   words in the same field.
+// - 0.16: no phrases and no prefixes; every value needs all its words in the
+//   same field (a quoted one without stemming, which the model leaves out),
+//   and `*` only separates words.
+// - `text` is an OR over from, to, subject and body.
 // ---------------------------------------------------------------------------
-describe('toWildcardQuery', () => {
-  it('appends * to a single word', () => {
-    expect(toWildcardQuery('pri')).toBe('pri*');
+type Version = '0.16' | '1.0';
+interface Message { id: string; from: string; to: string; subject: string; body: string }
+
+const MESSAGES: Message[] = [
+  { id: 'report', from: 'Anna Muster <anna@firma.de>', to: 'team@firma.de', subject: 'Draft: annual report 2024', body: 'The numbers are final.' },
+  { id: 'shuffled', from: 'Ben <ben@firma.de>', to: 'team@firma.de', subject: 'Report on annual goals, 2024 draft', body: '' },
+  { id: 'budget', from: 'Carla <carla@firma.de>', to: 'team@firma.de', subject: 'Project budget', body: 'Numbers for Q3.' },
+  { id: 'board', from: 'Dieter <dieter@firma.de>', to: 'team@firma.de', subject: 'Protokoll', body: 'Die Geschäftsführung hat entschieden.' },
+];
+
+const wordsOf = (value: string): string[] => value.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+const byteLength = (value: string) => new TextEncoder().encode(value).length;
+
+function fieldMatches(version: Version, value: string, field: string, hasPositions: boolean): boolean {
+  const tokens = wordsOf(field);
+  if (version === '1.0') {
+    const exact = /^"([\s\S]*)"$/.exec(value) ?? /^'([\s\S]*)'$/.exec(value);
+    if (exact) {
+      const phrase = wordsOf(exact[1]);
+      if (phrase.length === 0) return false;
+      if (!hasPositions) return phrase.every((w) => tokens.includes(w));
+      return tokens.some((_, i) => phrase.every((w, j) => tokens[i + j] === w));
+    }
+    if (value.endsWith('*')) {
+      const prefix = value.slice(0, -1).trim().toLowerCase();
+      if (!prefix || byteLength(prefix) > 16) return false;
+      return tokens.some((t) => byteLength(t) <= 16 && t.startsWith(prefix));
+    }
+  }
+  const words = wordsOf(value);
+  return words.length > 0 && words.every((w) => tokens.includes(w));
+}
+
+function messageMatches(version: Version, filter: Filter, m: Message): boolean {
+  if (filter.operator === 'AND') return (filter.conditions as Filter[]).every((c) => messageMatches(version, c, m));
+  const entries = Object.entries(filter) as [string, string][];
+  return entries.every(([key, value]) => {
+    switch (key) {
+      case 'text':
+        return fieldMatches(version, value, m.from, false) || fieldMatches(version, value, m.to, false)
+          || fieldMatches(version, value, m.subject, true) || fieldMatches(version, value, m.body, true);
+      case 'from':
+      case 'to':
+        return fieldMatches(version, value, m[key], false);
+      case 'subject':
+      case 'body':
+        return fieldMatches(version, value, m[key], true);
+      default:
+        throw new Error(`the model has no ${key} condition`);
+    }
+  });
+}
+
+const hits = (version: Version, filter: Filter) =>
+  MESSAGES.filter((m) => messageMatches(version, filter, m)).map((m) => m.id);
+
+// ---------------------------------------------------------------------------
+// splitSearchText / textConditions / textFilter
+// ---------------------------------------------------------------------------
+describe('splitSearchText', () => {
+  it('gives every quoted phrase a part of its own', () => {
+    expect(splitSearchText('"annual report" 2024 "draft"')).toEqual(['"annual report"', '2024', '"draft"']);
   });
 
-  it('appends * to every word in a multi-word query', () => {
-    expect(toWildcardQuery('hello world')).toBe('hello* world*');
+  it('keeps plain queries as one part, as typed', () => {
+    expect(splitSearchText('project budget')).toEqual(['project budget']);
+    expect(splitSearchText('anna@firma.de')).toEqual(['anna@firma.de']);
+    expect(splitSearchText('Geschäftsführung')).toEqual(['Geschäftsführung']);
+    expect(splitSearchText('  project   budget ')).toEqual(['project budget']);
   });
 
-  it('handles single-character queries', () => {
-    expect(toWildcardQuery('a')).toBe('a*');
+  it('gives every word ending in * a part of its own', () => {
+    expect(splitSearchText('project budg*')).toEqual(['project', 'budg*']);
+    expect(splitSearchText('"a b" c d*')).toEqual(['"a b"', 'c', 'd*']);
   });
 
-  it('handles two-character queries', () => {
-    expect(toWildcardQuery('pr')).toBe('pr*');
+  it('keeps the other words together in one part where the first of them was typed', () => {
+    expect(splitSearchText('q3 "annual report" budget')).toEqual(['q3 budget', '"annual report"']);
+    expect(splitSearchText('budg* "annual report" project')).toEqual(['budg*', '"annual report"', 'project']);
   });
 
-  it('handles long words', () => {
-    expect(toWildcardQuery('internationalization')).toBe('internationalization*');
+  it('closes an unterminated quote at the end of the input', () => {
+    expect(splitSearchText('"half typed')).toEqual(['"half typed"']);
+    expect(splitSearchText('invoice "half typed')).toEqual(['invoice', '"half typed"']);
   });
 
-  it('does not double-append * if already present', () => {
-    expect(toWildcardQuery('hello*')).toBe('hello*');
-    expect(toWildcardQuery('hello* world')).toBe('hello* world*');
+  it('drops empty quotes and lone stars', () => {
+    expect(splitSearchText('""')).toEqual([]);
+    expect(splitSearchText('"  " budget')).toEqual(['budget']);
+    expect(splitSearchText('*')).toEqual([]);
+    expect(splitSearchText('budget * **')).toEqual(['budget']);
   });
 
-  it('preserves quoted phrases ending with "', () => {
-    expect(toWildcardQuery('"hello world"')).toBe('"hello* world"');
+  it('strips outer single quotes, which would make the words one phrase', () => {
+    expect(splitSearchText("'annual' 2024 'draft'")).toEqual(["annual' 2024 'draft"]);
+    expect(splitSearchText("'annual report'")).toEqual(['annual report']);
+    expect(splitSearchText("''")).toEqual([]);
+  });
+});
+
+describe('textConditions / textFilter', () => {
+  it('makes one condition per part on the given property', () => {
+    expect(textConditions('"annual report" 2024 "draft"')).toEqual([
+      { text: '"annual report"' }, { text: '2024' }, { text: '"draft"' },
+    ]);
+    expect(textConditions('anna mül*', 'from')).toEqual([{ from: 'anna' }, { from: 'mül*' }]);
   });
 
-  it('trims leading/trailing whitespace', () => {
-    expect(toWildcardQuery('  hello  ')).toBe('hello*');
+  it('sends the input as before when no part is left', () => {
+    expect(textConditions('""')).toEqual([{ text: '""' }]);
+    expect(textConditions(' * ')).toEqual([{ text: '*' }]);
   });
 
-  it('collapses multiple spaces between words', () => {
-    expect(toWildcardQuery('hello    world')).toBe('hello* world*');
+  it('returns a single condition as is and ANDs several', () => {
+    expect(textFilter('project budget')).toEqual({ text: 'project budget' });
+    expect(textFilter('"annual report" 2024')).toEqual({
+      operator: 'AND',
+      conditions: [{ text: '"annual report"' }, { text: '2024' }],
+    });
+  });
+});
+
+describe('text search results', () => {
+  it('finds "annual report" 2024 "draft" on Stalwart 1.0, where the joined value was one phrase', () => {
+    expect(hits('1.0', { text: '"annual report" 2024 "draft"' })).toEqual([]);
+    expect(hits('1.0', textFilter('"annual report" 2024 "draft"'))).toEqual(['report']);
   });
 
-  it('returns empty string for empty input', () => {
-    expect(toWildcardQuery('')).toBe('');
+  it('keeps the 0.16 hits for "annual report" 2024 "draft": an AND of the words', () => {
+    expect(hits('0.16', { text: '"annual report" 2024 "draft"' })).toEqual(['report', 'shuffled']);
+    expect(hits('0.16', textFilter('"annual report" 2024 "draft"'))).toEqual(['report', 'shuffled']);
   });
 
-  it('returns empty string for whitespace-only input', () => {
-    expect(toWildcardQuery('   ')).toBe('');
+  it('finds project budg* on Stalwart 1.0 and changes nothing on 0.16', () => {
+    expect(hits('1.0', { text: 'project budg*' })).toEqual([]);
+    expect(hits('1.0', textFilter('project budg*'))).toEqual(['budget']);
+    expect(hits('0.16', { text: 'project budg*' })).toEqual([]);
+    expect(hits('0.16', textFilter('project budg*'))).toEqual([]);
   });
 
-  it('handles mixed words with and without wildcards', () => {
-    expect(toWildcardQuery('foo* bar baz*')).toBe('foo* bar* baz*');
+  it('sends plain queries unchanged, with the same hits on 0.16 and 1.0', () => {
+    const plain: Array<[string, string[]]> = [
+      ['project budget', ['budget']],
+      ['anna@firma.de', ['report']],
+      ['Geschäftsführung', ['board']],
+    ];
+    for (const [query, expected] of plain) {
+      expect(textFilter(query)).toEqual({ text: query });
+      expect(hits('0.16', textFilter(query))).toEqual(expected);
+      expect(hits('1.0', textFilter(query))).toEqual(expected);
+    }
   });
 });
 
@@ -70,19 +212,60 @@ describe('buildJMAPFilter', () => {
 
   // -- text query ----------------------------------------------------------
   describe('text query', () => {
-    it('builds a text filter with wildcard from textQuery alone', () => {
+    it('builds a text filter from textQuery alone, as typed', () => {
       const result = buildJMAPFilter('pri', emptyFilters);
-      expect(result).toEqual({ text: 'pri*' });
+      expect(result).toEqual({ text: 'pri' });
     });
 
-    it('wildcards each word in multi-word text query', () => {
+    it('keeps a multi-word query as one text condition', () => {
       const result = buildJMAPFilter('hello world', emptyFilters);
-      expect(result).toEqual({ text: 'hello* world*' });
+      expect(result).toEqual({ text: 'hello world' });
     });
 
     it('returns empty object when no query and no filters', () => {
       const result = buildJMAPFilter('', emptyFilters);
       expect(result).toEqual({});
+    });
+
+    it('keeps a lone phrase as one condition', () => {
+      expect(buildJMAPFilter('"annual report"', emptyFilters)).toEqual({ text: '"annual report"' });
+    });
+
+    it('ANDs quoted phrases and prefixes as separate conditions, next to inMailbox', () => {
+      const result = buildJMAPFilter('"annual report" 2024 budg*', emptyFilters, 'inbox-1');
+      expect(result).toEqual({
+        operator: 'AND',
+        conditions: [
+          { text: '"annual report"' },
+          { text: '2024' },
+          { text: 'budg*' },
+          { inMailbox: 'inbox-1' },
+        ],
+      });
+      expectNoMixedKeys(result);
+    });
+
+    it('splits the from, to, subject and body fields the same way', () => {
+      const filters: SearchFilters = {
+        ...emptyFilters,
+        from: 'anna mül*',
+        to: 'team@firma.de',
+        subject: '"Q3 report" draft',
+        body: "'annual report'",
+      };
+      const result = buildJMAPFilter('', filters);
+      expect(result).toEqual({
+        operator: 'AND',
+        conditions: [
+          { from: 'anna' },
+          { from: 'mül*' },
+          { to: 'team@firma.de' },
+          { subject: '"Q3 report"' },
+          { subject: 'draft' },
+          { body: 'annual report' },
+        ],
+      });
+      expectNoMixedKeys(result);
     });
   });
 
@@ -195,7 +378,7 @@ describe('buildJMAPFilter', () => {
       expect(result).toEqual({
         operator: 'AND',
         conditions: [
-          { text: 'pri*' },
+          { text: 'pri' },
           { inMailbox: 'inbox-1' },
         ],
       });
@@ -210,7 +393,7 @@ describe('buildJMAPFilter', () => {
       expect(result).toEqual({
         operator: 'AND',
         conditions: [
-          { text: 'urgent*' },
+          { text: 'urgent' },
           { from: 'alice' },
         ],
       });
@@ -227,7 +410,7 @@ describe('buildJMAPFilter', () => {
       expect(result).toEqual({
         operator: 'AND',
         conditions: [
-          { text: 'report*' },
+          { text: 'report' },
           { from: 'ceo@corp.com' },
           { subject: 'quarterly' },
           { hasAttachment: true },
@@ -247,13 +430,15 @@ describe('buildJMAPFilter', () => {
         dateBefore: '2024-12-31',
         isUnread: true,
         isStarred: true,
+        minSizeKb: '',
+        maxSizeKb: '',
       };
       const result = buildJMAPFilter('money', filters, 'mb-1') as {
         operator: string;
         conditions: Record<string, unknown>[];
       };
       expect(result.operator).toBe('AND');
-      expect(result.conditions).toContainEqual({ text: 'money*' });
+      expect(result.conditions).toContainEqual({ text: 'money' });
       expect(result.conditions).toContainEqual({ from: 'alice' });
       expect(result.conditions).toContainEqual({ to: 'bob' });
       expect(result.conditions).toContainEqual({ subject: 'invoice' });
@@ -358,6 +543,26 @@ describe('activeFilterCount', () => {
       dateBefore: '2024-12-31',
       isUnread: true,
       isStarred: true,
+      minSizeKb: '',
+      maxSizeKb: '',
     })).toBe(9);
+  });
+});
+
+describe('size filters', () => {
+  const base = { ...DEFAULT_SEARCH_FILTERS };
+
+  it('converts KB bounds to minSize / maxSize byte conditions', () => {
+    expect(buildJMAPFilter('', { ...base, minSizeKb: '100', maxSizeKb: '2048' })).toEqual({
+      operator: 'AND',
+      conditions: [{ minSize: 102400 }, { maxSize: 2097152 }],
+    });
+  });
+
+  it('ignores empty, zero and non-numeric sizes', () => {
+    expect(buildJMAPFilter('', { ...base, minSizeKb: '0', maxSizeKb: 'abc' })).toEqual({});
+    expect(isFilterEmpty({ ...base, minSizeKb: '0', maxSizeKb: '' })).toBe(true);
+    expect(isFilterEmpty({ ...base, minSizeKb: '5' })).toBe(false);
+    expect(activeFilterCount({ ...base, minSizeKb: '5', maxSizeKb: '9' })).toBe(2);
   });
 });

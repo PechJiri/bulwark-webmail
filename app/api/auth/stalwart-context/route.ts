@@ -1,12 +1,21 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { logger } from '@/lib/logger';
-import { JmapAuthVerificationError, assertBasicAuthMatchesUsername, normalizeJmapServerUrl, validateProxyAuthHeader, verifyJmapAuth } from '@/lib/auth/verify-jmap-auth';
+import { JmapAuthVerificationError, resolveJmapIdentity } from '@/lib/auth/verify-jmap-auth';
+import { cookies } from 'next/headers';
 import { setStalwartAuthContext } from '@/lib/stalwart/auth-context';
+import { readSignInStamp, writeSignInStamp } from '@/lib/auth/session-age';
+import { refreshTokenCookieName } from '@/lib/oauth/tokens';
 import { configManager } from '@/lib/admin/config-manager';
 import { isPublicHttpUrl } from '@/lib/security/url-guard';
 import { recordLogin } from '@/lib/telemetry/login-tracker';
 import { parseJmapServers, resolveTrustedJmapUrl } from '@/lib/admin/jmap-servers';
 import { MAX_ACCOUNT_SLOTS } from '@/lib/account-utils';
+import { rejectCrossOriginRequest } from '@/lib/security/same-origin';
+import { insecureCookieHint, verificationFailureBody } from '@/lib/auth/verification-failure';
+import { loginClientAddress } from '@/lib/auth/client-address';
+import { LOGIN_BUDGET_RETRY_AFTER_SECONDS, reserveLoginAttempt } from '@/lib/auth/verify-budget';
+import { isStoreUnavailable, storeUnavailableResponse } from '@/lib/auth/store-unavailable';
+import { recordStoredCredentialStatus } from '@/lib/stalwart/stored-credential-budget';
 
 function getSlot(request: NextRequest, bodySlot: unknown): number {
   if (typeof bodySlot === 'number' && bodySlot >= 0 && bodySlot < MAX_ACCOUNT_SLOTS) {
@@ -21,6 +30,12 @@ function getSlot(request: NextRequest, bodySlot: unknown): number {
 }
 
 export async function POST(request: NextRequest) {
+  // CSRF gate (GHSA-qvr9-m8cq-7wvg): cookies written here are SameSite=Lax,
+  // so a cross-site top-level POST would otherwise reach this handler.
+  const crossOrigin = rejectCrossOriginRequest(request);
+  if (crossOrigin) return crossOrigin;
+  let upstreamUrl = '';
+  let upstreamTrusted = false;
   try {
     const { serverUrl, username, authHeader, slot: bodySlot } = await request.json();
 
@@ -41,8 +56,6 @@ export async function POST(request: NextRequest) {
     const serverList = parseJmapServers(configManager.get<unknown>('jmapServers', []));
     const trustedUrl = resolveTrustedJmapUrl(serverUrl, configuredServerUrl, serverList);
 
-    let upstreamUrl: string;
-    let upstreamTrusted: boolean;
     if (trustedUrl) {
       upstreamUrl = trustedUrl;
       upstreamTrusted = true;
@@ -57,35 +70,71 @@ export async function POST(request: NextRequest) {
     }
 
     const slot = getSlot(request, bodySlot);
-    // Trusted (admin-configured) URLs skip the upstream re-fetch, but we
-    // still bind the cookie's `username` to the credential when we can verify
-    // locally. Without this, a caller can POST username="admin@host" +
-    // authHeader=<their own Basic creds>, and downstream consumers that read
-    // the cookie-derived username (audit logs, login tracker) accept the
-    // spoof. Bearer tokens are opaque so only the format check runs;
-    // authorization sinks must key off the credential itself, not the
-    // cookie's username claim (see admin/auth's authHeader-hashed cache key).
+    // Always verify the credential upstream and bind the cookie's `username`
+    // to it (GHSA-wxcm-j4jc-9fxq). The encrypted context this route writes is
+    // accepted as proof of identity by routes that never contact the mail
+    // server (settings sync, plugin-approval attribution), so minting it for
+    // an unchecked username lets anyone without an account read and overwrite
+    // any user's synced settings. Admin-configured servers are `trusted`,
+    // which only relaxes the public-address requirement (they may live on a
+    // private network) - never the credential check.
+    // Wrong credentials tried from here count against this server's address
+    // upstream, so each client gets a failure budget (lib/auth/verify-budget.ts).
+    const clientIp = loginClientAddress(request);
+    const refund = await reserveLoginAttempt(clientIp);
+    if (!refund) {
+      return NextResponse.json(
+        { error: 'too_many_attempts', hint: 'Too many failed sign-in attempts. Try again later.' },
+        { status: 429, headers: { 'Retry-After': String(LOGIN_BUDGET_RETRY_AFTER_SECONDS) } },
+      );
+    }
     let normalizedServerUrl: string;
-    if (upstreamTrusted) {
-      validateProxyAuthHeader(authHeader);
-      assertBasicAuthMatchesUsername(authHeader, username);
-      normalizedServerUrl = normalizeJmapServerUrl(upstreamUrl);
-    } else {
-      normalizedServerUrl = await verifyJmapAuth(upstreamUrl, authHeader, { trusted: false });
+    let accountName: string;
+    try {
+      ({ serverUrl: normalizedServerUrl, accountName } = await resolveJmapIdentity(upstreamUrl, authHeader, username, {
+        trusted: upstreamTrusted,
+        clientIp,
+      }));
+    } catch (error) {
+      // Only a credential the server rejected spends the budget; an outage
+      // or a mismatched claim says nothing about the password.
+      if (!(error instanceof JmapAuthVerificationError && error.status === 401)) await refund();
+      throw error;
+    }
+    await refund();
+    // Just signed in: an older refusal of this credential no longer applies.
+    await recordStoredCredentialStatus(authHeader, 200);
+
+    // A token sign-in's stamp (lib/auth/session-age.ts) knows no account:
+    // the token routes never see one. The first verified account names it,
+    // so the maximum session length of its domain applies on renewal.
+    const cookieStore = await cookies();
+    const refreshToken = cookieStore.get(refreshTokenCookieName(slot))?.value;
+    const stamp = refreshToken ? readSignInStamp(cookieStore, slot, refreshToken) : null;
+    if (refreshToken && stamp && !stamp.account) {
+      writeSignInStamp(cookieStore, slot, { signedInAt: stamp.signedInAt, refreshToken, account: accountName });
     }
 
     await setStalwartAuthContext(slot, {
       serverUrl: normalizedServerUrl,
       username,
       authHeader,
+      ...(accountName !== username ? { accountName } : {}),
     });
 
     void recordLogin(username, normalizedServerUrl);
 
-    return NextResponse.json({ ok: true });
+    const warning = insecureCookieHint(request);
+    if (warning) logger.warn(`stalwart-context: ${warning}`);
+    return NextResponse.json(warning ? { ok: true, warning } : { ok: true });
   } catch (error) {
+    // The sign-in limit can't be counted without the shared store: refused.
+    if (isStoreUnavailable(error)) return storeUnavailableResponse();
     if (error instanceof JmapAuthVerificationError) {
-      return NextResponse.json({ error: error.message }, { status: error.status });
+      return NextResponse.json(
+        verificationFailureBody('stalwart-context', error, upstreamUrl, upstreamTrusted),
+        { status: error.status },
+      );
     }
 
     logger.error('Failed to store Stalwart auth context', {

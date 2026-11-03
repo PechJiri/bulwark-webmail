@@ -1,29 +1,89 @@
 "use client";
 
+import { useEffect } from 'react';
 import { useTranslations } from 'next-intl';
 import { useCalendarStore, CalendarViewMode } from '@/stores/calendar-store';
-import { useSettingsStore } from '@/stores/settings-store';
+import { useSettingsStore, type MonthTimedEventStyle } from '@/stores/settings-store';
 import { usePolicyStore } from '@/stores/policy-store';
+import { useAuthStore } from '@/stores/auth-store';
+import { toast } from '@/stores/toast-store';
 import { SettingsSection, SettingItem, Select, ToggleSwitch } from './settings-section';
+import { cn } from '@/lib/utils';
+import { formatDisplayHour } from '@/lib/calendar-display-range';
+import { FreeBusyShareSetting } from './free-busy-share-setting';
+
+// Indexed by Date.getDay(), which is how calendarWorkingDays stores days.
+const DAY_KEYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as const;
+const DAY_SHORT_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'] as const;
 
 export function CalendarSettings() {
   const t = useTranslations('calendar.settings');
   const tViews = useTranslations('calendar.views');
+  const tDays = useTranslations('calendar.days');
 
-  const { viewMode, setViewMode } = useCalendarStore();
+  const { viewMode, setViewMode, participantIdentities, fetchParticipantIdentities, setDefaultParticipantIdentity } = useCalendarStore();
+  const client = useAuthStore((s) => s.client);
+
+  // ParticipantIdentity list (draft-ietf-jmap-calendars §6): which of the
+  // user's addresses organises new invitations. Loaded here because the
+  // settings page can open before the calendar app ever did.
+  useEffect(() => {
+    if (client && participantIdentities.length === 0) {
+      void fetchParticipantIdentities(client);
+    }
+  }, [client, participantIdentities.length, fetchParticipantIdentities]);
+  const defaultIdentityId = participantIdentities.find((i) => i.isDefault)?.id ?? participantIdentities[0]?.id ?? '';
   const {
     showTimeInMonthView,
+    calendarTintedEvents,
+    calendarMonthTimedEvents,
     showWeekNumbers,
+    calendarFreeScroll,
     enableCalendarTasks,
     showTasksOnCalendar,
     showBirthdayCalendar,
     calendarHoverPreview,
+    calendarLimitHours,
+    calendarDayStartHour,
+    calendarDayEndHour,
+    calendarHideNonWorkingDays,
+    calendarWorkingDays,
+    calendarInvitationParsingEnabled,
+    timeFormat,
+    firstDayOfWeek,
     updateSetting,
   } = useSettingsStore();
   const { isFeatureEnabled } = usePolicyStore();
 
+  // Visible hours (#1164). The end list only offers hours after the start,
+  // and moving the start past the end pushes the end along.
+  const hourOptions = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => {
+      const hour = from + i;
+      return { value: String(hour), label: formatDisplayHour(hour, timeFormat) };
+    });
+  const setStartHour = (hour: number) => {
+    updateSetting('calendarDayStartHour', hour);
+    if (calendarDayEndHour <= hour) updateSetting('calendarDayEndHour', hour + 1);
+  };
+
+  // Working days in the order the user's week runs.
+  const weekOrder = Array.from({ length: 7 }, (_, i) => (firstDayOfWeek + i) % 7);
+  const workingDays = Array.isArray(calendarWorkingDays) ? calendarWorkingDays : [];
+  const toggleWorkingDay = (day: number) => {
+    const current = new Set(workingDays);
+    if (current.has(day)) {
+      // The week view needs at least one day to show.
+      if (current.size === 1) return;
+      current.delete(day);
+    } else {
+      current.add(day);
+    }
+    updateSetting('calendarWorkingDays', [...current].sort((a, b) => a - b));
+  };
+
   return (
-    <SettingsSection title={t('title')}>
+    <SettingsSection id="calendar" title={t('title')}>
       <SettingItem label={t('default_view')}>
         <Select
           value={viewMode}
@@ -34,6 +94,37 @@ export function CalendarSettings() {
             { value: 'day', label: tViews('day') },
             { value: 'agenda', label: tViews('agenda') },
           ]}
+        />
+      </SettingItem>
+
+      {client && participantIdentities.length > 1 && (
+        <SettingItem
+          label={t('organizer_identity')}
+          description={t('organizer_identity_desc')}
+        >
+          <Select
+            value={defaultIdentityId}
+            onChange={(value) => {
+              setDefaultParticipantIdentity(client, value).catch((err) => {
+                toast.error(err instanceof Error ? err.message : t('organizer_identity_failed'));
+              });
+            }}
+            options={participantIdentities.map((i) => {
+              const address = i.calendarAddress.replace(/^mailto:/i, '');
+              return { value: i.id, label: i.name && i.name !== address ? `${i.name} <${address}>` : address };
+            })}
+          />
+        </SettingItem>
+      )}
+
+      {/* Not a notification: whether .ics attachments get calendar actions. Was under Notifications. */}
+      <SettingItem
+        label={t('invitation_parsing')}
+        description={t('invitation_parsing_desc')}
+      >
+        <ToggleSwitch
+          checked={calendarInvitationParsingEnabled}
+          onChange={(checked) => updateSetting('calendarInvitationParsingEnabled', checked)}
         />
       </SettingItem>
 
@@ -48,12 +139,115 @@ export function CalendarSettings() {
       </SettingItem>
 
       <SettingItem
+        label={t('tinted_events')}
+        description={t('tinted_events_desc')}
+      >
+        <ToggleSwitch
+          checked={calendarTintedEvents}
+          onChange={(checked) => updateSetting('calendarTintedEvents', checked)}
+        />
+      </SettingItem>
+
+      <SettingItem
+        label={t('month_timed_events')}
+        description={t('month_timed_events_desc')}
+      >
+        <Select
+          value={calendarMonthTimedEvents}
+          onChange={(value) => updateSetting('calendarMonthTimedEvents', value as MonthTimedEventStyle)}
+          options={[
+            { value: 'bar', label: t('month_timed_events_bar') },
+            { value: 'text', label: t('month_timed_events_text') },
+            { value: 'dot', label: t('month_timed_events_dot') },
+          ]}
+        />
+      </SettingItem>
+
+      <SettingItem
         label={t('show_week_numbers')}
         description={t('show_week_numbers_desc')}
       >
         <ToggleSwitch
           checked={showWeekNumbers}
           onChange={(checked) => updateSetting('showWeekNumbers', checked)}
+        />
+      </SettingItem>
+
+      <SettingItem
+        label={t('limit_hours')}
+        description={t('limit_hours_desc')}
+      >
+        <ToggleSwitch
+          checked={calendarLimitHours}
+          onChange={(checked) => updateSetting('calendarLimitHours', checked)}
+        />
+      </SettingItem>
+
+      {calendarLimitHours && (
+        <SettingItem label={t('visible_hours')}>
+          <div className="flex items-center gap-2">
+            <Select
+              value={String(calendarDayStartHour)}
+              onChange={(value) => setStartHour(parseInt(value, 10))}
+              options={hourOptions(0, 23)}
+              ariaLabel={t('visible_hours_start')}
+            />
+            <span className="text-muted-foreground">–</span>
+            <Select
+              value={String(calendarDayEndHour)}
+              onChange={(value) => updateSetting('calendarDayEndHour', parseInt(value, 10))}
+              options={hourOptions(Math.min(23, calendarDayStartHour) + 1, 24)}
+              ariaLabel={t('visible_hours_end')}
+            />
+          </div>
+        </SettingItem>
+      )}
+
+      <SettingItem
+        label={t('hide_non_working_days')}
+        description={t('hide_non_working_days_desc')}
+      >
+        <ToggleSwitch
+          checked={calendarHideNonWorkingDays}
+          onChange={(checked) => updateSetting('calendarHideNonWorkingDays', checked)}
+        />
+      </SettingItem>
+
+      {calendarHideNonWorkingDays && (
+        <SettingItem label={t('working_days')}>
+          <div className="flex flex-wrap gap-1.5" role="group" aria-label={t('working_days')}>
+            {weekOrder.map((day) => {
+              const selected = workingDays.includes(day);
+              return (
+                <button
+                  key={day}
+                  type="button"
+                  aria-pressed={selected}
+                  aria-label={tDays(DAY_KEYS[day])}
+                  title={tDays(DAY_KEYS[day])}
+                  onClick={() => toggleWorkingDay(day)}
+                  className={cn(
+                    'px-2.5 py-1.5 text-xs rounded-md transition-colors duration-150',
+                    selected
+                      ? 'bg-primary text-primary-foreground font-medium'
+                      : 'bg-muted hover:bg-accent text-foreground'
+                  )}
+                >
+                  {tDays(DAY_SHORT_KEYS[day])}
+                </button>
+              );
+            })}
+          </div>
+        </SettingItem>
+      )}
+
+      <SettingItem
+        label={t('calendar_free_scroll')}
+        description={t('calendar_free_scroll_desc')}
+      >
+        <ToggleSwitch
+          checked={calendarFreeScroll}
+          onChange={(checked) => updateSetting('calendarFreeScroll', checked)}
         />
       </SettingItem>
 
@@ -83,6 +277,8 @@ export function CalendarSettings() {
           onChange={(checked) => updateSetting('showBirthdayCalendar', checked)}
         />
       </SettingItem>
+
+      <FreeBusyShareSetting />
 
       {isFeatureEnabled('calendarTasksEnabled') && (
       <>

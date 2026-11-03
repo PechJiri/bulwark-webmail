@@ -6,6 +6,10 @@ export interface JmapServerOAuthConfig {
   clientId?: string;
   issuerUrl?: string;
   clientSecret?: string;
+  /** Text of this server's sign-in button, e.g. "Sign in with Google"; the generic SSO label otherwise. */
+  buttonLabel?: string;
+  /** The provider's logout URL, used instead of a discovered end_session_endpoint (#1279). Never sent to the browser. */
+  endSessionUrl?: string;
 }
 
 export interface JmapServerEntry {
@@ -13,7 +17,14 @@ export interface JmapServerEntry {
   label: string;
   url: string;
   domains?: string[];
-  oauth?: JmapServerOAuthConfig;
+  oauth?: JmapServerOAuthConfig & {
+    /**
+     * Set on the admin dashboard's view of an entry instead of the secret
+     * itself: an admin session may change the secret but never read it
+     * back. Never persisted.
+     */
+    hasClientSecret?: boolean;
+  };
 }
 
 export interface PublicJmapServerEntry {
@@ -24,6 +35,7 @@ export interface PublicJmapServerEntry {
   oauth?: {
     clientId?: string;
     issuerUrl?: string;
+    buttonLabel?: string;
   };
 }
 
@@ -78,11 +90,16 @@ export function parseJmapServers(raw: unknown): JmapServerEntry[] {
       const clientId = typeof o.clientId === 'string' ? o.clientId.trim() : '';
       const issuerUrl = typeof o.issuerUrl === 'string' ? trimUrl(o.issuerUrl) : '';
       const clientSecret = typeof o.clientSecret === 'string' ? o.clientSecret : '';
-      if (clientId || issuerUrl || clientSecret) {
+      const buttonLabel = typeof o.buttonLabel === 'string' ? o.buttonLabel.trim().slice(0, 64) : '';
+      // Kept as written: some providers' logout path ends in a slash.
+      const endSessionUrl = typeof o.endSessionUrl === 'string' ? o.endSessionUrl.trim() : '';
+      if (clientId || issuerUrl || clientSecret || endSessionUrl) {
         oauth = {};
         if (clientId) oauth.clientId = clientId;
         if (issuerUrl && isHttpUrl(issuerUrl)) oauth.issuerUrl = issuerUrl;
         if (clientSecret) oauth.clientSecret = clientSecret;
+        if (buttonLabel) oauth.buttonLabel = buttonLabel;
+        if (endSessionUrl && isHttpUrl(endSessionUrl)) oauth.endSessionUrl = endSessionUrl;
       }
     }
     out.push({
@@ -94,6 +111,16 @@ export function parseJmapServers(raw: unknown): JmapServerEntry[] {
     });
   }
   return out;
+}
+
+/**
+ * An entry with its own OAuth client and a button label gets a sign-in button
+ * of its own on the login page, even while OAuth is off globally. A client id
+ * alone keeps its older meaning: the registered client that password and TOTP
+ * logins use, which must not start offering OAuth on its own.
+ */
+export function offersOwnOAuth(server: PublicJmapServerEntry | undefined): boolean {
+  return !!(server?.oauth?.clientId && server.oauth.buttonLabel);
 }
 
 /** Strip secrets for client-side exposure. */
@@ -108,10 +135,52 @@ export function redactJmapServers(servers: JmapServerEntry[]): PublicJmapServerE
           oauth: {
             ...(s.oauth.clientId ? { clientId: s.oauth.clientId } : {}),
             ...(s.oauth.issuerUrl ? { issuerUrl: s.oauth.issuerUrl } : {}),
+            ...(s.oauth.buttonLabel ? { buttonLabel: s.oauth.buttonLabel } : {}),
           },
         }
       : {}),
   }));
+}
+
+/**
+ * The admin dashboard's view: every field except the per-server OAuth client
+ * secret, which is replaced by `hasClientSecret`. The dashboard shows the
+ * global client secret and the session secret the same way (`hasValue`), so
+ * that a stolen admin session cannot lift the secrets in one request.
+ */
+export function redactJmapServersForAdmin(servers: JmapServerEntry[]): JmapServerEntry[] {
+  return servers.map((s) => {
+    if (!s.oauth) return s;
+    const { clientSecret, hasClientSecret: _ignored, ...rest } = s.oauth;
+    void _ignored;
+    return { ...s, oauth: { ...rest, ...(clientSecret ? { hasClientSecret: true } : {}) } };
+  });
+}
+
+/**
+ * Complete a dashboard-submitted server list with the client secrets already
+ * stored. The dashboard never holds the secret, so an entry that still has an
+ * OAuth block but names no `clientSecret` keeps the stored one; an explicit
+ * empty string clears it, and dropping the OAuth block drops the secret with
+ * it. Operates on the raw request value so the caller can still validate it.
+ */
+export function withStoredClientSecrets(incoming: unknown, stored: JmapServerEntry[]): unknown {
+  if (!Array.isArray(incoming)) return incoming;
+  const secrets = new Map<string, string>();
+  for (const entry of stored) {
+    if (entry.oauth?.clientSecret) secrets.set(entry.id, entry.oauth.clientSecret);
+  }
+  return incoming.map((item) => {
+    if (!item || typeof item !== 'object') return item;
+    const e = item as Record<string, unknown>;
+    if (typeof e.id !== 'string' || !e.oauth || typeof e.oauth !== 'object') return item;
+    const o = e.oauth as Record<string, unknown>;
+    const { hasClientSecret: _flag, ...oauth } = o;
+    void _flag;
+    const storedSecret = secrets.get(e.id.trim());
+    if (oauth.clientSecret === undefined && storedSecret) oauth.clientSecret = storedSecret;
+    return { ...e, oauth };
+  });
 }
 
 export function findServerById(servers: JmapServerEntry[], id: string | null | undefined): JmapServerEntry | undefined {
@@ -132,14 +201,6 @@ export function findServerByUrl(servers: JmapServerEntry[], url: string | null |
   if (!url) return undefined;
   const target = normalizeUrl(url);
   return servers.find((s) => normalizeUrl(s.url) === target);
-}
-
-/** Find the server whose `domains` array matches the given email's domain (case-insensitive). */
-export function findServerByEmailDomain(servers: JmapServerEntry[], email: string | null | undefined): JmapServerEntry | undefined {
-  if (!email || !email.includes('@')) return undefined;
-  const domain = email.split('@')[1]?.trim().toLowerCase();
-  if (!domain) return undefined;
-  return servers.find((s) => (s.domains ?? []).some((d) => d.toLowerCase() === domain));
 }
 
 /**

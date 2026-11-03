@@ -42,6 +42,41 @@ export function generateAvatarColor(email: string): string {
   return colors[Math.abs(hash) % colors.length];
 }
 
+/**
+ * The `KEYWORD_PALETTE` key whose tint matches an account's avatar colour.
+ *
+ * Row tints are Tailwind class pairs (light + dark) rather than raw colours, so
+ * an account's hex cannot be used directly as a background. Mapping onto the
+ * shared tag palette keeps account tints in the same visual language as tag
+ * tints and gets dark mode for free.
+ *
+ * These pick the palette's `-dark` variants. A tag tint can afford to be faint
+ * because the tag also shows a coloured chip, but an account tint replaces the
+ * account dot and has to carry that information on its own - the fainter
+ * variants are close to invisible against the row background.
+ *
+ * The palette has no violet, so the two purple-ish avatar hues would collide.
+ * Purple keeps `purple-dark` and violet falls back to the plain `purple`, whose
+ * lighter wash still tells the two apart.
+ */
+export function accountTintKey(avatarColor: string | undefined): string {
+  switch ((avatarColor ?? '').toLowerCase()) {
+    case '#2563eb': return 'blue-dark';
+    case '#7c3aed': return 'purple';
+    case '#db2777': return 'pink-dark';
+    case '#dc2626': return 'red-dark';
+    case '#ea580c': return 'orange-dark';
+    case '#d97706': return 'amber-dark';
+    case '#65a30d': return 'lime-dark';
+    case '#16a34a': return 'green-dark';
+    case '#0d9488': return 'teal-dark';
+    case '#0891b2': return 'cyan-dark';
+    case '#6366f1': return 'indigo-dark';
+    case '#9333ea': return 'purple-dark';
+    default: return 'gray-dark';
+  }
+}
+
 /** Get initials for an avatar from a display name or email */
 export function getInitials(name: string, email?: string): string {
   if (name) {
@@ -55,11 +90,6 @@ export function getInitials(name: string, email?: string): string {
     return email[0]?.toUpperCase() ?? '?';
   }
   return '?';
-}
-
-/** Build an account-scoped localStorage key */
-export function getAccountScopedKey(baseKey: string, accountId: string): string {
-  return `${baseKey}::${accountId}`;
 }
 
 /**
@@ -87,7 +117,13 @@ export const MAX_ACCOUNTS_HTTP1 = 5;
  */
 export function isHttp2Available(): boolean {
   if (typeof performance === 'undefined') return false;
-  const entries = performance.getEntriesByType('resource') as PerformanceResourceTiming[];
+  // The document connection is already known before any subresources finish
+  // loading. Include it so a fresh login/restore doesn't incorrectly cap an
+  // HTTP/2 page at five accounts. Do not assume h2 when timing is unavailable.
+  const entries = [
+    ...performance.getEntriesByType('navigation'),
+    ...performance.getEntriesByType('resource'),
+  ] as PerformanceResourceTiming[];
   for (let i = entries.length - 1; i >= 0; i--) {
     const proto = entries[i].nextHopProtocol;
     if (proto === 'h2' || proto === 'h3') return true;
@@ -101,6 +137,36 @@ export function isHttp2Available(): boolean {
  */
 export function getMaxAccounts(): number {
   return isHttp2Available() ? MAX_ACCOUNT_SLOTS : MAX_ACCOUNTS_HTTP1;
+}
+
+/** Minimal shape needed to name an account in a list (structural — avoids importing AccountEntry). */
+export interface NamedAccount {
+  id: string;
+  displayName?: string;
+  label: string;
+  email?: string;
+  username: string;
+}
+
+/**
+ * The bold title and the line under it for an account in a list. Usually the
+ * name over the address. One person signed in to two mailboxes has the same
+ * name, and often the same picture, on both, so the rows only differed in the
+ * small address line: when another account shares the name, the address
+ * becomes the title and the name is left out. A name that is just the address
+ * again is left out too.
+ */
+export function accountRowText(
+  account: NamedAccount,
+  accounts: NamedAccount[],
+): { title: string; subtitle: string | null } {
+  const key = (value: string) => value.trim().toLowerCase();
+  const nameOf = (a: NamedAccount) => a.displayName || a.label;
+  const name = nameOf(account);
+  const address = account.email || account.username;
+  const shared = accounts.some((a) => a.id !== account.id && key(nameOf(a)) === key(name));
+  if (!name || shared || key(name) === key(address)) return { title: address, subtitle: null };
+  return { title: name, subtitle: address };
 }
 
 /** Minimal shape needed to order accounts (structural — avoids importing AccountEntry). */

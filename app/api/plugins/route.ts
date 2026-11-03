@@ -1,16 +1,25 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
+import { canSeeInstanceDetails } from '@/lib/auth/instance-details';
 import { getPluginRegistry, getThemeRegistry } from '@/lib/admin/plugin-registry';
 import { listDevPlugins } from '@/lib/admin/plugin-dev';
 import { configManager } from '@/lib/admin/config-manager';
 import { logger } from '@/lib/logger';
+import { storeUnavailableResponse } from '@/lib/admin/store-unavailable-response';
+import { isNoThirdPartyTrafficOn } from '@/lib/admin/third-party-mode';
+import { pluginAllowedInMode } from '@/lib/outgoing-hosts';
 
 /**
  * GET /api/plugins - Public endpoint for clients to discover server-managed plugins & themes
  *
  * Returns all enabled plugins and themes so the client can sync them to IndexedDB.
- * No admin auth required - this is how regular users receive plugins/themes.
+ * No admin auth required - this is how regular users receive plugins/themes -
+ * but a session is: the list names the plugins and the hosts they may reach,
+ * and the client only syncs after signing in.
  */
-export async function GET() {
+export async function GET(request: NextRequest) {
+  if (!(await canSeeInstanceDetails(request))) {
+    return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+  }
   try {
     await configManager.ensureLoaded();
     const policy = configManager.getPolicy();
@@ -26,11 +35,15 @@ export async function GET() {
     // plugin without uninstalling it first.
     const devIds = new Set(devEntries.map(e => e.plugin.id));
     const installedEnabled = pluginRegistry.plugins.filter(p => p.enabled && !devIds.has(p.id));
+    // Plugins that declare network access never reach a browser while the
+    // server must stay off outside hosts (#903); the rest run as usual, and
+    // so do those that reach only servers the admin entered for them.
+    const noThirdParty = await isNoThirdPartyTrafficOn();
 
     const plugins = [
       ...devEntries.map(e => ({ ...e.plugin, dev: true })),
       ...installedEnabled.map(p => ({ ...p, dev: false })),
-    ].map(p => ({
+    ].filter(p => !noThirdParty || pluginAllowedInMode(p)).map(p => ({
       id: p.id,
       name: p.name,
       version: p.version,
@@ -57,6 +70,8 @@ export async function GET() {
       httpOrigins: p.httpOrigins,
       // Surface so clients can enforce api.http.post path allowlists.
       apiPostPaths: p.apiPostPaths,
+      // Which credentials the plugin may use through the proxy; no secrets.
+      credentials: p.credentials,
       // Per-user settings schema, captured from the manifest at upload/load
       // time so the client can render the settings UI without re-parsing.
       settingsSchema: p.settingsSchema,
@@ -76,6 +91,8 @@ export async function GET() {
         description: t.description,
         variants: t.variants,
         forceEnabled: t.forceEnabled || false,
+        hasSkin: t.hasSkin || false,
+        contentHash: t.contentHash,
       }));
 
     return NextResponse.json(
@@ -83,6 +100,8 @@ export async function GET() {
       { headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (error) {
+    const unavailable = storeUnavailableResponse(error);
+    if (unavailable) return unavailable;
     logger.error('Plugin list error', { error: error instanceof Error ? error.message : 'Unknown error' });
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }

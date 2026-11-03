@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { apiFetch } from '@/lib/browser-navigation';
+import { IS_LITE } from '@/lib/lite';
 import type { UpdateStatus, UpdateSeverity } from '@/lib/version-check/types';
 
 const POLL_INTERVAL_MS = 15 * 60 * 1000;
@@ -51,7 +52,8 @@ export const useUpdateStore = create<UpdateState>()((set, get) => ({
   },
 
   startPolling: () => {
-    if (pollTimer) return;
+    // The update check is served by the Node.js backend; the static build has none.
+    if (IS_LITE || pollTimer) return;
     void get().fetchStatus();
     pollTimer = setInterval(() => {
       void get().fetchStatus();
@@ -79,9 +81,19 @@ export interface BannerInfo {
   advisory: string | null;
 }
 
+// A status whose `current` isn't the build we're running was cached by a
+// previous version and can't be trusted - after an upgrade it still reports
+// the old version as outdated (#913). The server drops those too; this is the
+// last line of defence against a response cached in the browser.
+function isStale(st: UpdateStatus): boolean {
+  const running = (process.env.NEXT_PUBLIC_APP_VERSION || '').trim();
+  return !!running && st.current !== running;
+}
+
 export function selectBanner(s: UpdateState): BannerInfo | null {
   const st = s.status;
   if (!st || !st.updateAvailable) return null;
+  if (isStale(st)) return null;
   if (st.severity === 'none' || st.severity === 'unknown') return null;
 
   if (st.severity === 'security') {
@@ -114,5 +126,7 @@ export function selectBanner(s: UpdateState): BannerInfo | null {
 // Used by the admin shield + admin sidebar to show a dot when an update is
 // available. Mirrors selectBanner's "should we show something" logic.
 export function selectHasUpdate(s: UpdateState): boolean {
-  return !!s.status?.updateAvailable && s.status.severity !== 'unknown';
+  const st = s.status;
+  if (!st || !st.updateAvailable || st.severity === 'unknown') return false;
+  return !isStale(st);
 }
